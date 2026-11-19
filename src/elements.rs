@@ -423,19 +423,34 @@ impl Iterator for WayNodeLocationsIter<'_> {
 impl ExactSizeIterator for WayNodeLocationsIter<'_> {}
 
 /// The element type of a relation member.
+///
+/// This enum is `#[non_exhaustive]`: the OpenStreetMap data model may grow new
+/// member types, and files are not trusted to only contain the ones this crate
+/// knows about. Match arms should therefore end with a `_ =>` arm.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RelMemberType {
+    /// The member is a node.
     Node,
+    /// The member is a way.
     Way,
+    /// The member is a relation.
     Relation,
+    /// A member type this crate does not know, containing the raw value from
+    /// the file. It is returned instead of panicking on malformed or future
+    /// data.
+    Unknown(i32),
 }
 
 impl From<EnumOrUnknown<MemberType>> for RelMemberType {
     fn from(rmt: EnumOrUnknown<MemberType>) -> RelMemberType {
-        match rmt.unwrap() {
-            MemberType::NODE => RelMemberType::Node,
-            MemberType::WAY => RelMemberType::Way,
-            MemberType::RELATION => RelMemberType::Relation,
+        match rmt.enum_value() {
+            Ok(MemberType::NODE) => RelMemberType::Node,
+            Ok(MemberType::WAY) => RelMemberType::Way,
+            Ok(MemberType::RELATION) => RelMemberType::Relation,
+            // Unknown enum values are legal on the wire (proto2 semantics),
+            // so keep the raw number instead of failing the whole parse.
+            Err(raw) => RelMemberType::Unknown(raw),
         }
     }
 }

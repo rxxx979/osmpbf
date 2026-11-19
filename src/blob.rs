@@ -12,10 +12,13 @@ use std::path::Path;
 use flate2::read::ZlibDecoder;
 
 /// Maximum allowed [`BlobHeader`] size in bytes.
-pub static MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
+pub const MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
 
 /// Maximum allowed uncompressed [`Blob`] content size in bytes.
-pub static MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
+///
+/// The format applies the same limit to the size of the serialized `Blob`
+/// message, which is what the `datasize` field of a blob header announces.
+pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 
 /// The content type of a blob.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,7 +279,15 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             None => return None,
         };
 
-        let mut reader = self.reader.by_ref().take(header.datasize() as u64);
+        let data_size = match blob_data_size(&header) {
+            Ok(size) => size,
+            Err(err) => {
+                self.last_blob_ok = false;
+                return Some(Err(err));
+            }
+        };
+
+        let mut reader = self.reader.by_ref().take(data_size);
         let blob = match fileformat::Blob::parse_from_reader(&mut reader) {
             Ok(blob) => blob,
             Err(e) => {
@@ -286,9 +297,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             }
         };
 
-        self.offset = self
-            .offset
-            .map(|x| ByteOffset(x.0 + header.datasize() as u64));
+        self.offset = self.offset.map(|x| ByteOffset(x.0 + data_size));
 
         Some(Ok(Blob::new(header, blob, prev_offset)))
     }
@@ -355,6 +364,10 @@ impl<R: Read + Seek + Send> BlobReader<R> {
 
     /// Seek to an offset in bytes from the start of the stream.
     ///
+    /// Seeking also clears a previous decoding error, so a reader that stopped
+    /// on a malformed blob can be repositioned to a known-good offset and
+    /// reused.
+    ///
     /// # Example
     /// ```
     /// use osmpbf::*;
@@ -376,6 +389,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
         match self.reader.seek(SeekFrom::Start(pos.0)) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
+                self.last_blob_ok = true;
                 Ok(())
             }
             Err(e) => {
@@ -386,10 +400,13 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     }
 
     /// Seek to an offset in bytes. (See `std::io::Seek`)
+    ///
+    /// Like [`seek`](Self::seek), this clears a previous decoding error.
     pub fn seek_raw(&mut self, pos: SeekFrom) -> Result<u64> {
         match self.reader.seek(pos) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
+                self.last_blob_ok = true;
                 Ok(offset)
             }
             Err(e) => {
@@ -418,8 +435,16 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             None => return None,
         };
 
+        let data_size = match blob_data_size(&header) {
+            Ok(size) => size,
+            Err(err) => {
+                self.last_blob_ok = false;
+                return Some(Err(err));
+            }
+        };
+
         // skip blob (which also adjusts self.offset)
-        if let Err(err) = self.seek_raw(SeekFrom::Current(header.datasize() as i64)) {
+        if let Err(err) = self.seek_raw(SeekFrom::Current(data_size as i64)) {
             self.last_blob_ok = false;
             return Some(Err(err));
         }
@@ -449,6 +474,23 @@ impl BlobReader<BufReader<File>> {
         let f = File::open(path.as_ref())?;
         let buf_reader = BufReader::new(f);
         Self::new_seekable(buf_reader)
+    }
+}
+
+/// Validates the `datasize` field of a blob header.
+///
+/// The format defines `datasize` as the exact length of the serialized
+/// [`fileformat::Blob`] message, which is capped by [`MAX_BLOB_MESSAGE_SIZE`].
+/// A negative or oversized value means the file is corrupt: computing offsets
+/// from it would wrap around and could point anywhere in the stream.
+pub(crate) fn blob_data_size(header: &fileformat::BlobHeader) -> Result<u64> {
+    let size = header.datasize();
+    if (0..=MAX_BLOB_MESSAGE_SIZE as i32).contains(&size) {
+        Ok(size as u64)
+    } else {
+        Err(new_blob_error(BlobError::InvalidDataSize {
+            size: i64::from(size),
+        }))
     }
 }
 

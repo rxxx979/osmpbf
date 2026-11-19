@@ -1,7 +1,7 @@
 //! Iterate over blobs from a memory map
 
 use self::fileformat::BlobHeader;
-use crate::blob::{decode_blob, BlobDecode, BlobType, ByteOffset};
+use crate::blob::{blob_data_size, decode_blob, BlobDecode, BlobType, ByteOffset};
 use crate::block::{HeaderBlock, PrimitiveBlock};
 use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
 use crate::proto::{fileformat, osmformat};
@@ -152,6 +152,10 @@ impl MmapBlobReader<'_> {
 
     /// Move the cursor to the given byte offset.
     ///
+    /// Offsets past the end of the memory map are clamped to its length; the
+    /// next call to [`next`](Iterator::next) then simply ends the iteration.
+    /// Seeking also clears a previous decoding error.
+    ///
     /// # Example
     /// ```
     /// use osmpbf::*;
@@ -174,7 +178,9 @@ impl MmapBlobReader<'_> {
     /// # foo().unwrap();
     /// ```
     pub fn seek(&mut self, pos: ByteOffset) {
-        self.offset = pos.0 as usize;
+        let len = self.mmap.as_slice().len();
+        self.offset = (pos.0 as usize).min(len);
+        self.last_blob_ok = true;
     }
 }
 
@@ -182,6 +188,11 @@ impl<'a> Iterator for MmapBlobReader<'a> {
     type Item = Result<MmapBlob<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Stop iteration if there was an error; `seek` clears this state.
+        if !self.last_blob_ok {
+            return None;
+        }
+
         let slice = &self.mmap.as_slice()[self.offset..];
 
         match slice.len() {
@@ -219,7 +230,13 @@ impl<'a> Iterator for MmapBlobReader<'a> {
             }
         };
 
-        let data_size = header.datasize() as usize;
+        let data_size = match blob_data_size(&header) {
+            Ok(size) => size as usize,
+            Err(e) => {
+                self.last_blob_ok = false;
+                return Some(Err(e));
+            }
+        };
         let chunk_size = 4 + header_size + data_size;
 
         if slice.len() < chunk_size {

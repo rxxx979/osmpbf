@@ -77,6 +77,11 @@ pub enum BlobError {
         /// Blob content size in bytes.
         size: u64,
     },
+    /// The size announced by a blob header is negative or exceeds the format limit.
+    InvalidDataSize {
+        /// Announced size in bytes, as stored in the header.
+        size: i64,
+    },
     /// The blob is empty because the `raw` and `zlib-data` fields are missing.
     Empty,
 }
@@ -128,6 +133,7 @@ impl StdError for Error {
             }
             ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => "blob header is too big",
             ErrorKind::Blob(BlobError::MessageTooBig { .. }) => "blob message is too big",
+            ErrorKind::Blob(BlobError::InvalidDataSize { .. }) => "invalid blob data size",
             ErrorKind::Blob(BlobError::Empty) => "blob is missing fields 'raw' and 'zlib_data",
         }
     }
@@ -141,6 +147,7 @@ impl StdError for Error {
             ErrorKind::Blob(BlobError::InvalidHeaderSize) => None,
             ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => None,
             ErrorKind::Blob(BlobError::MessageTooBig { .. }) => None,
+            ErrorKind::Blob(BlobError::InvalidDataSize { .. }) => None,
             ErrorKind::Blob(BlobError::Empty) => None,
         }
     }
@@ -167,6 +174,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Blob(BlobError::MessageTooBig { size }) => {
                 write!(f, "blob message is too big: {size} bytes")
+            }
+            ErrorKind::Blob(BlobError::InvalidDataSize { size }) => {
+                write!(f, "invalid blob data size: {size} bytes")
             }
             ErrorKind::Blob(BlobError::Empty) => {
                 write!(f, "blob is missing fields 'raw' and 'zlib_data'")

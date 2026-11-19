@@ -124,7 +124,8 @@ impl Blob {
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        decode_blob(&self.blob).map(PrimitiveBlock::new)
+        let payload = blob_payload(&self.blob)?;
+        PrimitiveBlock::parse(&payload)
     }
 }
 
@@ -541,17 +542,23 @@ pub(crate) fn blob_data_size(header: &fileformat::BlobHeader) -> Result<u64> {
     }
 }
 
-pub(crate) fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
+/// Returns the uncompressed content of a blob.
+///
+/// The declared size limits are enforced here: an oversized or unsupported
+/// blob is reported instead of being handed to a parser.
+pub(crate) fn blob_payload(blob: &fileformat::Blob) -> Result<Vec<u8>> {
     if blob.has_raw() {
         let size = blob.raw().len() as u64;
         if size < MAX_BLOB_MESSAGE_SIZE {
-            T::parse_from_bytes(blob.raw()).map_err(|e| new_protobuf_error(e, "raw blob data"))
+            Ok(blob.raw().to_vec())
         } else {
             Err(new_blob_error(BlobError::MessageTooBig { size }))
         }
     } else if blob.has_zlib_data() {
         let mut decoder = ZlibDecoder::new(blob.zlib_data()).take(MAX_BLOB_MESSAGE_SIZE);
-        T::parse_from_reader(&mut decoder).map_err(|e| new_protobuf_error(e, "blob zlib data"))
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).map_err(Error::from)?;
+        Ok(payload)
     } else if blob.has_lz4_data() {
         // Recognized by the format, but not implemented here. Reporting it
         // explicitly beats claiming that the blob is empty.
@@ -569,6 +576,12 @@ pub(crate) fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
     } else {
         Err(new_blob_error(BlobError::Empty))
     }
+}
+
+/// Decodes the uncompressed content of a blob into a protobuf message.
+pub(crate) fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
+    let payload = blob_payload(blob)?;
+    T::parse_from_bytes(&payload).map_err(|e| new_protobuf_error(e, "blob data"))
 }
 
 #[cfg(test)]

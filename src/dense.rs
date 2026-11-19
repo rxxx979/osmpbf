@@ -1,11 +1,14 @@
 //! Iterate over the dense nodes in a `PrimitiveGroup`
+//!
+//! Dense nodes are stored as parallel packed arrays. Instead of materialising
+//! those arrays, the iterators here keep one cursor per array and decode the
+//! values on demand, so a block costs no per-element allocation.
 
 use crate::block::{get_stringtable_key_value, str_from_stringtable};
 use crate::error::Result;
 use crate::proto::osmformat;
-use std;
+use crate::wire::{FieldIter, PackedVarints, WireValue, read_varint_opt};
 
-//TODO Add getter functions for id, version, uid, ...
 /// An OpenStreetMap node element from a compressed array of dense nodes (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Node)).
 #[derive(Clone, Debug)]
 pub struct DenseNode<'a> {
@@ -16,7 +19,8 @@ pub struct DenseNode<'a> {
     pub id: i64,
     lat: i64,
     lon: i64,
-    keys_vals_indices: &'a [i32],
+    /// The packed (key index, value index) varints of this node's tags.
+    keys_vals: &'a [u8],
     info: Option<DenseNodeInfo<'a>>,
 }
 
@@ -63,10 +67,15 @@ impl<'a> DenseNode<'a> {
     }
 
     /// Returns an iterator over the tags of this node (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
+    ///
+    /// Iteration is best effort: a tag whose key or value index is out of
+    /// bounds, or whose string is not valid UTF-8, is skipped instead of
+    /// ending the iteration.
     pub fn tags(&self) -> DenseTagIter<'a> {
         DenseTagIter {
             block: self.block,
-            keys_vals_indices: self.keys_vals_indices.iter(),
+            keys_vals: self.keys_vals,
+            pos: 0,
         }
     }
 
@@ -76,7 +85,8 @@ impl<'a> DenseNode<'a> {
     /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
     pub fn raw_tags(&self) -> DenseRawTagIter<'a> {
         DenseRawTagIter {
-            keys_vals_indices: self.keys_vals_indices.iter(),
+            keys_vals: self.keys_vals,
+            pos: 0,
         }
     }
 }
@@ -85,52 +95,63 @@ impl<'a> DenseNode<'a> {
 #[derive(Clone, Debug)]
 pub struct DenseNodeIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
-    dids: std::slice::Iter<'a, i64>,  // deltas
-    cid: i64,                         // current id
-    dlats: std::slice::Iter<'a, i64>, // deltas
-    clat: i64,
-    dlons: std::slice::Iter<'a, i64>, // deltas
-    clon: i64,
-    keys_vals_slice: &'a [i32],
-    keys_vals_index: usize,
-    info_iter: Option<DenseNodeInfoIter<'a>>,
+    ids: PackedVarints<'a>,
+    lats: PackedVarints<'a>,
+    lons: PackedVarints<'a>,
+    keys_vals: &'a [u8],
+    keys_vals_pos: usize,
+    info: Option<DenseNodeInfoIter<'a>>,
 }
 
 impl<'a> DenseNodeIter<'a> {
-    pub(crate) fn new(
+    /// Creates an iterator over the `DenseNodes` message in `dense`.
+    pub(crate) fn from_wire(
         block: &'a osmformat::PrimitiveBlock,
-        osmdense: &'a osmformat::DenseNodes,
+        dense: &'a [u8],
     ) -> DenseNodeIter<'a> {
-        let info_iter = Some(DenseNodeInfoIter::new(
-            block,
-            osmdense.denseinfo.get_or_default(),
-        ));
+        let mut ids: &[u8] = &[];
+        let mut lats: &[u8] = &[];
+        let mut lons: &[u8] = &[];
+        let mut keys_vals: &[u8] = &[];
+        let mut info = None;
+
+        // Best effort, like the rest of the block layer: a malformed field
+        // ends the scan rather than failing the whole iteration.
+        let mut fields = FieldIter::new(dense);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            match (field, value) {
+                (1, WireValue::Bytes(value)) => ids = value,
+                (8, WireValue::Bytes(value)) => lats = value,
+                (9, WireValue::Bytes(value)) => lons = value,
+                (10, WireValue::Bytes(value)) => keys_vals = value,
+                (5, WireValue::Bytes(value)) if info.is_none() => {
+                    info = Some(DenseNodeInfoIter::from_wire(block, value));
+                }
+                _ => {}
+            }
+        }
+
         DenseNodeIter {
             block,
-            dids: osmdense.id.iter(),
-            cid: 0,
-            dlats: osmdense.lat.iter(),
-            clat: 0,
-            dlons: osmdense.lon.iter(),
-            clon: 0,
-            keys_vals_slice: osmdense.keys_vals.as_slice(),
-            keys_vals_index: 0,
-            info_iter,
+            ids: PackedVarints::delta(ids),
+            lats: PackedVarints::delta(lats),
+            lons: PackedVarints::delta(lons),
+            keys_vals,
+            keys_vals_pos: 0,
+            info,
         }
     }
 
+    /// Creates an iterator that yields nothing.
     pub(crate) fn empty(block: &'a osmformat::PrimitiveBlock) -> DenseNodeIter<'a> {
         DenseNodeIter {
             block,
-            dids: [].iter(),
-            cid: 0,
-            dlats: [].iter(),
-            clat: 0,
-            dlons: [].iter(),
-            clon: 0,
-            keys_vals_slice: &[],
-            keys_vals_index: 0,
-            info_iter: None,
+            ids: PackedVarints::delta(&[]),
+            lats: PackedVarints::delta(&[]),
+            lons: PackedVarints::delta(&[]),
+            keys_vals: &[],
+            keys_vals_pos: 0,
+            info: None,
         }
     }
 }
@@ -139,51 +160,58 @@ impl<'a> Iterator for DenseNodeIter<'a> {
     type Item = DenseNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (
-            self.dids.next(),
-            self.dlats.next(),
-            self.dlons.next(),
-            self.info_iter.as_mut().and_then(|iter| iter.next()),
-        ) {
-            (Some(did), Some(dlat), Some(dlon), info) => {
-                self.cid += *did;
-                self.clat += *dlat;
-                self.clon += *dlon;
+        let id = self.ids.next_value()?;
+        let lat = self.lats.next_value()?;
+        let lon = self.lons.next_value()?;
 
-                let start_index = self.keys_vals_index;
-                let mut end_index = start_index;
-                for chunk in self.keys_vals_slice[self.keys_vals_index..].chunks(2) {
-                    if chunk[0] != 0 && chunk.len() == 2 {
-                        end_index += 2;
-                        self.keys_vals_index += 2;
-                    } else {
-                        self.keys_vals_index += 1;
-                        break;
-                    }
-                }
+        let (keys_vals, next_pos) = scan_tags(self.keys_vals, self.keys_vals_pos);
+        self.keys_vals_pos = next_pos;
 
-                Some(DenseNode {
-                    block: self.block,
-                    id: self.cid,
-                    lat: self.clat,
-                    lon: self.clon,
-                    keys_vals_indices: &self.keys_vals_slice[start_index..end_index],
-                    info,
-                })
-            }
-            _ => None,
-        }
+        Some(DenseNode {
+            block: self.block,
+            id,
+            lat,
+            lon,
+            keys_vals,
+            info: self.info.as_mut().and_then(|iter| iter.next()),
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // The three delta arrays are parallel; a shorter one ends the
-        // iteration, so it also bounds the reported length.
-        let len = self.dids.len().min(self.dlats.len()).min(self.dlons.len());
-        (len, Some(len))
+        // Each value takes at least one byte, so the remaining bytes bound the
+        // number of remaining nodes. Malformed entries may end it earlier.
+        let upper = self
+            .ids
+            .upper_bound()
+            .min(self.lats.upper_bound())
+            .min(self.lons.upper_bound());
+        (0, Some(upper))
     }
 }
 
-impl ExactSizeIterator for DenseNodeIter<'_> {}
+/// Finds the packed tag pairs that belong to one dense node.
+///
+/// Returns the byte range of the pairs and the position after them (past the
+/// zero delimiter, if there is one).
+#[inline]
+fn scan_tags(buf: &[u8], start: usize) -> (&[u8], usize) {
+    let mut pos = start;
+    let mut end = start;
+    while pos < buf.len() {
+        let key = match read_varint_opt(buf, &mut pos) {
+            Some(key) => key,
+            None => break,
+        };
+        if key == 0 {
+            break;
+        }
+        if read_varint_opt(buf, &mut pos).is_none() {
+            break;
+        }
+        end = pos;
+    }
+    (&buf[start..end], pos)
+}
 
 /// Optional metadata with non-geographic information about a dense node
 #[derive(Clone, Debug)]
@@ -246,35 +274,50 @@ impl<'a> DenseNodeInfo<'a> {
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfoIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
-    versions: std::slice::Iter<'a, i32>,
-    dtimestamps: std::slice::Iter<'a, i64>, // deltas
-    ctimestamp: i64,
-    dchangesets: std::slice::Iter<'a, i64>, // deltas
-    cchangeset: i64,
-    duids: std::slice::Iter<'a, i32>, // deltas
-    cuid: i32,
-    duser_sids: std::slice::Iter<'a, i32>, // deltas
-    cuser_sid: i32,
-    visible: std::slice::Iter<'a, bool>,
+    versions: PackedVarints<'a>,
+    timestamps: PackedVarints<'a>,
+    changesets: PackedVarints<'a>,
+    uids: PackedVarints<'a>,
+    user_sids: PackedVarints<'a>,
+    visible: PackedVarints<'a>,
 }
 
 impl<'a> DenseNodeInfoIter<'a> {
-    fn new(
+    /// Creates an iterator over a `DenseInfo` message.
+    pub(crate) fn from_wire(
         block: &'a osmformat::PrimitiveBlock,
-        info: &'a osmformat::DenseInfo,
+        info: &'a [u8],
     ) -> DenseNodeInfoIter<'a> {
+        let mut versions: &[u8] = &[];
+        let mut timestamps: &[u8] = &[];
+        let mut changesets: &[u8] = &[];
+        let mut uids: &[u8] = &[];
+        let mut user_sids: &[u8] = &[];
+        let mut visible: &[u8] = &[];
+
+        let mut fields = FieldIter::new(info);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            if let WireValue::Bytes(value) = value {
+                match field {
+                    1 => versions = value,
+                    2 => timestamps = value,
+                    3 => changesets = value,
+                    4 => uids = value,
+                    5 => user_sids = value,
+                    6 => visible = value,
+                    _ => {}
+                }
+            }
+        }
+
         DenseNodeInfoIter {
             block,
-            versions: info.version.iter(),
-            dtimestamps: info.timestamp.iter(),
-            ctimestamp: 0,
-            dchangesets: info.changeset.iter(),
-            cchangeset: 0,
-            duids: info.uid.iter(),
-            cuid: 0,
-            duser_sids: info.user_sid.iter(),
-            cuser_sid: 0,
-            visible: info.visible.iter(),
+            versions: PackedVarints::plain(versions),
+            timestamps: PackedVarints::delta(timestamps),
+            changesets: PackedVarints::delta(changesets),
+            uids: PackedVarints::delta(uids),
+            user_sids: PackedVarints::delta(user_sids),
+            visible: PackedVarints::plain(visible),
         }
     }
 }
@@ -283,38 +326,22 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
     type Item = DenseNodeInfo<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (
-            self.versions.next(),
-            self.dtimestamps.next(),
-            self.dchangesets.next(),
-            self.duids.next(),
-            self.duser_sids.next(),
-            self.visible.next(),
-        ) {
-            (
-                Some(&version),
-                Some(dtimestamp),
-                Some(dchangeset),
-                Some(duid),
-                Some(duser_sid),
-                visible_opt,
-            ) => {
-                self.ctimestamp += *dtimestamp;
-                self.cchangeset += *dchangeset;
-                self.cuid += *duid;
-                self.cuser_sid += *duser_sid;
-                Some(DenseNodeInfo {
-                    block: self.block,
-                    version,
-                    timestamp: self.ctimestamp,
-                    changeset: self.cchangeset,
-                    uid: self.cuid,
-                    user_sid: self.cuser_sid,
-                    visible: *visible_opt.unwrap_or(&true),
-                })
-            }
-            _ => None,
-        }
+        let version = self.versions.next_value()? as i32;
+        let timestamp = self.timestamps.next_value()?;
+        let changeset = self.changesets.next_value()?;
+        let uid = self.uids.next_value()? as i32;
+        let user_sid = self.user_sids.next_value()? as i32;
+        let visible = self.visible.next_value().unwrap_or(1) != 0;
+
+        Some(DenseNodeInfo {
+            block: self.block,
+            version,
+            timestamp,
+            changeset,
+            uid,
+            user_sid,
+            visible,
+        })
     }
 }
 
@@ -327,7 +354,17 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
 #[derive(Clone, Debug)]
 pub struct DenseTagIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
-    keys_vals_indices: std::slice::Iter<'a, i32>,
+    keys_vals: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DenseTagIter<'a> {
+    /// Reads the next raw index, or `None` at the end of the array.
+    #[inline]
+    fn next_index(&mut self) -> Option<usize> {
+        let value = read_varint_opt(self.keys_vals, &mut self.pos)?;
+        Some(value as usize)
+    }
 }
 
 impl<'a> Iterator for DenseTagIter<'a> {
@@ -335,8 +372,8 @@ impl<'a> Iterator for DenseTagIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let key_index = *self.keys_vals_indices.next()? as usize;
-            let val_index = *self.keys_vals_indices.next()? as usize;
+            let key_index = self.next_index()?;
+            let val_index = self.next_index()?;
             if let Some(tag) =
                 get_stringtable_key_value(self.block, Some(key_index), Some(val_index))
             {
@@ -348,7 +385,7 @@ impl<'a> Iterator for DenseTagIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Malformed entries are skipped, so only the upper bound is known.
-        (0, Some(self.keys_vals_indices.len() / 2))
+        (0, Some((self.keys_vals.len() - self.pos) / 2))
     }
 }
 
@@ -356,23 +393,30 @@ impl<'a> Iterator for DenseTagIter<'a> {
 /// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
 #[derive(Clone, Debug)]
 pub struct DenseRawTagIter<'a> {
-    keys_vals_indices: std::slice::Iter<'a, i32>,
+    keys_vals: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DenseRawTagIter<'a> {
+    /// Reads the next raw index, or `None` at the end of the array.
+    #[inline]
+    fn next_index(&mut self) -> Option<i32> {
+        let value = read_varint_opt(self.keys_vals, &mut self.pos)?;
+        Some(value as i32)
+    }
 }
 
 impl Iterator for DenseRawTagIter<'_> {
     type Item = (i32, i32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.keys_vals_indices.next(), self.keys_vals_indices.next()) {
-            (Some(&key_index), Some(&val_index)) => Some((key_index, val_index)),
-            _ => None,
-        }
+        let key_index = self.next_index()?;
+        let val_index = self.next_index()?;
+        Some((key_index, val_index))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.keys_vals_indices.len() / 2;
-        (len, Some(len))
+        // Each index takes at least one byte, so this bounds the pairs.
+        (0, Some((self.keys_vals.len() - self.pos) / 2))
     }
 }
-
-impl ExactSizeIterator for DenseRawTagIter<'_> {}

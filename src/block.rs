@@ -2,8 +2,10 @@
 
 use crate::dense::DenseNodeIter;
 use crate::elements::{Element, Node, Relation, Way};
-use crate::error::{ErrorKind, Result, new_error};
+use crate::error::{ErrorKind, Result, new_error, new_protobuf_error};
 use crate::proto::osmformat;
+use crate::wire::{FieldIter, WireValue};
+use protobuf::Message;
 use std;
 
 /// A `HeaderBlock`. It contains metadata about following [`PrimitiveBlock`]s.
@@ -108,22 +110,93 @@ pub struct HeaderBBox {
 /// A `PrimitiveBlock`. It contains a sequence of groups.
 #[derive(Clone, Debug)]
 pub struct PrimitiveBlock {
+    /// Block-wide fields: string table, granularity, coordinate offsets. Its
+    /// `primitivegroup` field is always empty; groups are stored separately so
+    /// that dense nodes can be decoded straight from the wire.
     block: osmformat::PrimitiveBlock,
+    groups: Vec<GroupData>,
+}
+
+/// How one group of a [`PrimitiveBlock`] is stored.
+#[derive(Clone, Debug)]
+enum GroupData {
+    /// A group whose dense nodes are decoded on demand from the wire format.
+    /// `other` is only set for a group that mixes dense nodes with other
+    /// elements, which the format does not produce but a malformed file might.
+    Dense {
+        dense: Vec<u8>,
+        other: Option<osmformat::PrimitiveGroup>,
+    },
+    /// A group decoded with protobuf.
+    Proto(osmformat::PrimitiveGroup),
 }
 
 impl PrimitiveBlock {
-    pub(crate) fn new(block: osmformat::PrimitiveBlock) -> PrimitiveBlock {
-        PrimitiveBlock { block }
+    /// Parses a serialized `PrimitiveBlock`.
+    ///
+    /// The string table and the block-wide parameters are decoded eagerly (they
+    /// are small); dense node arrays stay in their wire format and are decoded
+    /// element by element.
+    pub(crate) fn parse(data: &[u8]) -> Result<PrimitiveBlock> {
+        let mut strings = Vec::new();
+        let mut granularity = 100;
+        let mut lat_offset = 0;
+        let mut lon_offset = 0;
+        let mut date_granularity = 1000;
+        let mut groups = Vec::new();
+        let mut has_stringtable = false;
+
+        let mut fields = FieldIter::new(data);
+        while let Some((field, value)) = fields.next_field()? {
+            match (field, value) {
+                (1, WireValue::Bytes(bytes)) => {
+                    strings = parse_string_table(bytes)?;
+                    has_stringtable = true;
+                }
+                (2, WireValue::Bytes(bytes)) => groups.push(parse_group(bytes)?),
+                (17, WireValue::Varint(value)) => granularity = value as i32,
+                (18, WireValue::Varint(value)) => date_granularity = value as i32,
+                (19, WireValue::Varint(value)) => lat_offset = value as i64,
+                (20, WireValue::Varint(value)) => lon_offset = value as i64,
+                // A known field with the wrong wire type means this is not a
+                // `PrimitiveBlock` at all (for example a header blob fed to
+                // `to_primitiveblock`), so fail instead of misreading it.
+                (1 | 2, WireValue::Varint(_)) | (17..=20, WireValue::Bytes(_)) => {
+                    return Err(malformed_block("unexpected wire type"));
+                }
+                // Unknown fields are skipped on purpose: the format is allowed
+                // to grow, and a future field must not make old readers fail.
+                _ => {}
+            }
+        }
+
+        // `stringtable` is a proto2 required field; a payload without it is not
+        // a PrimitiveBlock (a header blob, for example).
+        if !has_stringtable {
+            return Err(malformed_block("missing required stringtable"));
+        }
+
+        let mut block = osmformat::PrimitiveBlock::new();
+        block.stringtable = protobuf::MessageField::some(osmformat::StringTable {
+            s: strings,
+            ..Default::default()
+        });
+        block.granularity = Some(granularity);
+        block.lat_offset = Some(lat_offset);
+        block.lon_offset = Some(lon_offset);
+        block.date_granularity = Some(date_granularity);
+
+        Ok(PrimitiveBlock { block, groups })
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`.
     pub fn elements(&self) -> BlockElementsIter<'_> {
-        BlockElementsIter::new(&self.block)
+        BlockElementsIter::new(&self.block, &self.groups)
     }
 
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
-        GroupIter::new(&self.block)
+        GroupIter::new(&self.block, &self.groups)
     }
 
     /// Calls the given closure on each element.
@@ -156,39 +229,143 @@ impl PrimitiveBlock {
     }
 }
 
+/// Decodes a `StringTable` message into its list of strings.
+fn parse_string_table(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut strings = Vec::new();
+    let mut fields = FieldIter::new(data);
+    while let Some((field, value)) = fields.next_field()? {
+        match (field, value) {
+            (1, WireValue::Bytes(string)) => strings.push(string.to_vec()),
+            (1, WireValue::Varint(_)) => return Err(malformed_block("unexpected wire type")),
+            _ => {}
+        }
+    }
+    Ok(strings)
+}
+
+/// Decides how a `PrimitiveGroup` should be stored.
+fn parse_group(data: &[u8]) -> Result<GroupData> {
+    let mut dense: Option<&[u8]> = None;
+    let mut has_other = false;
+
+    let mut fields = FieldIter::new(data);
+    while let Some((field, value)) = fields.next_field()? {
+        match (field, value) {
+            (2, WireValue::Bytes(bytes)) => dense = Some(bytes),
+            (1 | 3 | 4 | 5, _) => has_other = true,
+            _ => {}
+        }
+    }
+
+    match dense {
+        None => Ok(GroupData::Proto(parse_primitive_group(data)?)),
+        Some(dense) => {
+            validate_dense(dense)?;
+            let other = if has_other {
+                Some(parse_primitive_group(data)?)
+            } else {
+                None
+            };
+            Ok(GroupData::Dense {
+                dense: dense.to_vec(),
+                other,
+            })
+        }
+    }
+}
+
+/// Rejects dense node arrays that are not packed.
+///
+/// The schema declares `[packed = true]`, so every writer packs these arrays.
+/// A file that sends them unpacked would otherwise decode to zero nodes
+/// without any error, which is exactly the kind of silent loss this crate
+/// tries to avoid.
+fn validate_dense(data: &[u8]) -> Result<()> {
+    let mut fields = FieldIter::new(data);
+    while let Some((field, value)) = fields.next_field()? {
+        if matches!(field, 1 | 8 | 9 | 10) && matches!(value, WireValue::Varint(_)) {
+            return Err(malformed_block("dense arrays must be packed"));
+        }
+    }
+    Ok(())
+}
+
+/// Builds an error for a block that does not follow the wire format.
+fn malformed_block(reason: &'static str) -> crate::error::Error {
+    new_error(ErrorKind::MalformedBlock { reason })
+}
+
+/// Decodes a whole `PrimitiveGroup` with protobuf.
+fn parse_primitive_group(data: &[u8]) -> Result<osmformat::PrimitiveGroup> {
+    osmformat::PrimitiveGroup::parse_from_bytes(data)
+        .map_err(|error| new_protobuf_error(error, "primitive group"))
+}
+
 /// A `PrimitiveGroup` contains a sequence of elements of one type.
 #[derive(Clone, Debug)]
 pub struct PrimitiveGroup<'a> {
     block: &'a osmformat::PrimitiveBlock,
-    group: &'a osmformat::PrimitiveGroup,
+    data: &'a GroupData,
 }
 
 impl<'a> PrimitiveGroup<'a> {
-    fn new(
-        block: &'a osmformat::PrimitiveBlock,
-        group: &'a osmformat::PrimitiveGroup,
-    ) -> PrimitiveGroup<'a> {
-        PrimitiveGroup { block, group }
+    fn new(block: &'a osmformat::PrimitiveBlock, data: &'a GroupData) -> PrimitiveGroup<'a> {
+        PrimitiveGroup { block, data }
+    }
+
+    /// Elements of this group that were decoded with protobuf, if any.
+    fn proto(&self) -> Option<&'a osmformat::PrimitiveGroup> {
+        match self.data {
+            GroupData::Dense { other, .. } => other.as_ref(),
+            GroupData::Proto(group) => Some(group),
+        }
+    }
+
+    /// The nodes of this group, or an empty slice for a dense group.
+    fn node_slice(&self) -> &'a [osmformat::Node] {
+        match self.proto() {
+            Some(group) => group.nodes.as_slice(),
+            None => &[],
+        }
+    }
+
+    /// The ways of this group, or an empty slice for a dense group.
+    fn way_slice(&self) -> &'a [osmformat::Way] {
+        match self.proto() {
+            Some(group) => group.ways.as_slice(),
+            None => &[],
+        }
+    }
+
+    /// The relations of this group, or an empty slice for a dense group.
+    fn relation_slice(&self) -> &'a [osmformat::Relation] {
+        match self.proto() {
+            Some(group) => group.relations.as_slice(),
+            None => &[],
+        }
     }
 
     /// Returns an iterator over the nodes in this group.
     pub fn nodes(&self) -> GroupNodeIter<'a> {
-        GroupNodeIter::new(self.block, self.group)
+        GroupNodeIter::new(self.block, self.node_slice())
     }
 
     /// Returns an iterator over the dense nodes in this group.
     pub fn dense_nodes(&self) -> DenseNodeIter<'a> {
-        DenseNodeIter::new(self.block, self.group.dense.get_or_default())
+        match self.data {
+            GroupData::Dense { dense, .. } => DenseNodeIter::from_wire(self.block, dense),
+            GroupData::Proto(_) => DenseNodeIter::empty(self.block),
+        }
     }
 
     /// Returns an iterator over the ways in this group.
     pub fn ways(&self) -> GroupWayIter<'a> {
-        GroupWayIter::new(self.block, self.group)
+        GroupWayIter::new(self.block, self.way_slice())
     }
 
     /// Returns an iterator over the relations in this group.
     pub fn relations(&self) -> GroupRelationIter<'a> {
-        GroupRelationIter::new(self.block, self.group)
+        GroupRelationIter::new(self.block, self.relation_slice())
     }
 }
 
@@ -197,7 +374,7 @@ impl<'a> PrimitiveGroup<'a> {
 pub struct BlockElementsIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
     state: ElementsIterState,
-    groups: std::slice::Iter<'a, osmformat::PrimitiveGroup>,
+    groups: std::slice::Iter<'a, GroupData>,
     dense_nodes: DenseNodeIter<'a>,
     nodes: std::slice::Iter<'a, osmformat::Node>,
     ways: std::slice::Iter<'a, osmformat::Way>,
@@ -214,11 +391,11 @@ enum ElementsIterState {
 }
 
 impl<'a> BlockElementsIter<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock) -> BlockElementsIter<'a> {
+    fn new(block: &'a osmformat::PrimitiveBlock, groups: &'a [GroupData]) -> BlockElementsIter<'a> {
         BlockElementsIter {
             block,
             state: ElementsIterState::Group,
-            groups: block.primitivegroup.iter(),
+            groups: groups.iter(),
             dense_nodes: DenseNodeIter::empty(block),
             nodes: [].iter(),
             ways: [].iter(),
@@ -233,12 +410,13 @@ impl<'a> BlockElementsIter<'a> {
     fn step(&mut self) -> Option<Option<Element<'a>>> {
         match self.state {
             ElementsIterState::Group => match self.groups.next() {
-                Some(group) => {
+                Some(data) => {
+                    let group = PrimitiveGroup::new(self.block, data);
                     self.state = ElementsIterState::DenseNode;
-                    self.dense_nodes = DenseNodeIter::new(self.block, group.dense.get_or_default());
-                    self.nodes = group.nodes.iter();
-                    self.ways = group.ways.iter();
-                    self.relations = group.relations.iter();
+                    self.dense_nodes = group.dense_nodes();
+                    self.nodes = group.node_slice().iter();
+                    self.ways = group.way_slice().iter();
+                    self.relations = group.relation_slice().iter();
                     None
                 }
                 None => Some(None),
@@ -292,14 +470,14 @@ impl<'a> Iterator for BlockElementsIter<'a> {
 #[derive(Clone, Debug)]
 pub struct GroupIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
-    groups: std::slice::Iter<'a, osmformat::PrimitiveGroup>,
+    groups: std::slice::Iter<'a, GroupData>,
 }
 
 impl<'a> GroupIter<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock) -> GroupIter<'a> {
+    fn new(block: &'a osmformat::PrimitiveBlock, groups: &'a [GroupData]) -> GroupIter<'a> {
         GroupIter {
             block,
-            groups: block.primitivegroup.iter(),
+            groups: groups.iter(),
         }
     }
 }
@@ -309,7 +487,7 @@ impl<'a> Iterator for GroupIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.groups.next() {
-            Some(g) => Some(PrimitiveGroup::new(self.block, g)),
+            Some(data) => Some(PrimitiveGroup::new(self.block, data)),
             None => None,
         }
     }
@@ -331,11 +509,11 @@ pub struct GroupNodeIter<'a> {
 impl<'a> GroupNodeIter<'a> {
     fn new(
         block: &'a osmformat::PrimitiveBlock,
-        group: &'a osmformat::PrimitiveGroup,
+        nodes: &'a [osmformat::Node],
     ) -> GroupNodeIter<'a> {
         GroupNodeIter {
             block,
-            nodes: group.nodes.iter(),
+            nodes: nodes.iter(),
         }
     }
 }
@@ -365,13 +543,10 @@ pub struct GroupWayIter<'a> {
 }
 
 impl<'a> GroupWayIter<'a> {
-    fn new(
-        block: &'a osmformat::PrimitiveBlock,
-        group: &'a osmformat::PrimitiveGroup,
-    ) -> GroupWayIter<'a> {
+    fn new(block: &'a osmformat::PrimitiveBlock, ways: &'a [osmformat::Way]) -> GroupWayIter<'a> {
         GroupWayIter {
             block,
-            ways: group.ways.iter(),
+            ways: ways.iter(),
         }
     }
 }
@@ -403,11 +578,11 @@ pub struct GroupRelationIter<'a> {
 impl<'a> GroupRelationIter<'a> {
     fn new(
         block: &'a osmformat::PrimitiveBlock,
-        group: &'a osmformat::PrimitiveGroup,
+        relations: &'a [osmformat::Relation],
     ) -> GroupRelationIter<'a> {
         GroupRelationIter {
             block,
-            rels: group.relations.iter(),
+            rels: relations.iter(),
         }
     }
 }

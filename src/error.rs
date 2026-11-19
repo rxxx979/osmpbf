@@ -56,6 +56,11 @@ pub enum ErrorKind {
     StringtableUtf8 { err: Utf8Error, index: usize },
     /// An element contains an out-of-bounds index to the stringtable.
     StringtableIndexOutOfBounds { index: usize },
+    /// A block does not follow the protobuf wire format.
+    MalformedBlock {
+        /// What went wrong while decoding.
+        reason: &'static str,
+    },
     /// An error that occurs when decoding `Blob`s.
     Blob(BlobError),
     //TODO add UnexpectedPrimitiveBlock
@@ -110,6 +115,7 @@ impl StdError for Error {
             ErrorKind::Protobuf { ref err, .. } => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
+            ErrorKind::MalformedBlock { .. } => None,
             ErrorKind::Blob(_) => None,
         }
     }
@@ -127,6 +133,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::StringtableIndexOutOfBounds { index } => {
                 write!(f, "stringtable index out of bounds: {index}")
+            }
+            ErrorKind::MalformedBlock { reason } => {
+                write!(f, "malformed block: {reason}")
             }
             ErrorKind::Blob(BlobError::InvalidHeaderSize) => {
                 write!(f, "blob header size could not be decoded")

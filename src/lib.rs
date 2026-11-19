@@ -90,6 +90,7 @@ pub mod elements;
 mod error;
 pub mod indexed;
 pub mod reader;
+mod wire;
 
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/mod.rs"));

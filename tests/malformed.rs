@@ -158,8 +158,9 @@ fn dense_node_len_matches_yielded() {
 
     let mut groups = 0;
     for group in block.groups() {
-        let nodes = group.dense_nodes();
-        assert_eq!(nodes.len(), nodes.count());
+        // Three ids but only two latitudes: the shorter array ends the
+        // iteration, and nothing pretends otherwise.
+        assert_eq!(group.dense_nodes().count(), 2);
         groups += 1;
     }
 

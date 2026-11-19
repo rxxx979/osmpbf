@@ -5,8 +5,6 @@ use std::result;
 use std::str;
 use std::str::Utf8Error;
 
-use protobuf::Error as ProtobufError;
-
 // Error data structures are modeled just like in the `csv` crate by BurntSushi.
 
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
@@ -15,10 +13,6 @@ pub(crate) fn new_error(kind: ErrorKind) -> Error {
 
 pub(crate) fn new_blob_error(kind: BlobError) -> Error {
     Error(Box::new(ErrorKind::Blob(kind)))
-}
-
-pub(crate) fn new_protobuf_error(err: ProtobufError, location: &'static str) -> Error {
-    Error(Box::new(ErrorKind::Protobuf { err, location }))
 }
 
 /// A type alias for `Result<T, osmpbf::Error>`.
@@ -46,11 +40,6 @@ impl Error {
 pub enum ErrorKind {
     /// An error for I/O operations.
     Io(io::Error),
-    /// An error that occurs when decoding a protobuf message.
-    Protobuf {
-        err: ProtobufError,
-        location: &'static str,
-    },
     /// The stringtable contains an entry at `index` that could not be decoded to a valid UTF-8
     /// string.
     StringtableUtf8 { err: Utf8Error, index: usize },
@@ -82,6 +71,11 @@ pub enum BlobError {
         /// Blob content size in bytes.
         size: u64,
     },
+    /// A blob header does not follow the expected wire format.
+    MalformedHeader {
+        /// What went wrong.
+        reason: &'static str,
+    },
     /// The size announced by a blob header is negative or exceeds the format limit.
     InvalidDataSize {
         /// Announced size in bytes, as stored in the header.
@@ -112,7 +106,6 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self.0 {
             ErrorKind::Io(ref err) => Some(err),
-            ErrorKind::Protobuf { ref err, .. } => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
             ErrorKind::MalformedBlock { .. } => None,
@@ -125,9 +118,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self.0 {
             ErrorKind::Io(ref err) => err.fmt(f),
-            ErrorKind::Protobuf { ref err, location } => {
-                write!(f, "protobuf error at '{location}': {err}")
-            }
             ErrorKind::StringtableUtf8 { ref err, index } => {
                 write!(f, "invalid UTF-8 at string table index {index}: {err}")
             }
@@ -145,6 +135,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Blob(BlobError::MessageTooBig { size }) => {
                 write!(f, "blob message is too big: {size} bytes")
+            }
+            ErrorKind::Blob(BlobError::MalformedHeader { reason }) => {
+                write!(f, "malformed blob header: {reason}")
             }
             ErrorKind::Blob(BlobError::InvalidDataSize { size }) => {
                 write!(f, "invalid blob data size: {size} bytes")

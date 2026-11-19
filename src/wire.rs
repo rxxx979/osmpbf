@@ -67,6 +67,7 @@ pub(crate) enum WireValue<'a> {
 }
 
 /// Iterates over the fields of a serialized message.
+#[derive(Clone, Debug)]
 pub(crate) struct FieldIter<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -128,54 +129,80 @@ impl<'a> FieldIter<'a> {
     }
 }
 
+/// How the values of a packed field are encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Packing {
+    /// `int32`/`bool`/`enum` values, stored as two's complement varints.
+    Plain,
+    /// `sint32`/`sint64` values that are delta coded (coordinates, ids).
+    Delta,
+    /// `sint32`/`sint64` values that are not delta coded.
+    Zigzag,
+}
+
 /// A cursor over the values of a packed repeated field.
-///
-/// `delta` selects the zigzag + running-sum decoding used by the
-/// coordinate and DenseInfo arrays; plain mode is used for `int32`/`bool`
-/// fields such as `keys_vals`.
 #[derive(Clone, Debug)]
 pub(crate) struct PackedVarints<'a> {
     buf: &'a [u8],
     pos: usize,
     current: i64,
-    delta: bool,
+    packing: Packing,
 }
 
 impl<'a> PackedVarints<'a> {
-    /// Cursor over plain varints.
-    pub(crate) fn plain(buf: &'a [u8]) -> PackedVarints<'a> {
+    /// Creates a cursor with the given packing.
+    pub(crate) fn new(buf: &'a [u8], packing: Packing) -> PackedVarints<'a> {
         PackedVarints {
             buf,
             pos: 0,
             current: 0,
-            delta: false,
+            packing,
         }
+    }
+
+    /// Cursor over plain varints.
+    pub(crate) fn plain(buf: &'a [u8]) -> PackedVarints<'a> {
+        PackedVarints::new(buf, Packing::Plain)
     }
 
     /// Cursor over delta and zigzag encoded varints.
     pub(crate) fn delta(buf: &'a [u8]) -> PackedVarints<'a> {
-        PackedVarints {
-            buf,
-            pos: 0,
-            current: 0,
-            delta: true,
-        }
+        PackedVarints::new(buf, Packing::Delta)
+    }
+
+    /// Cursor over zigzag encoded varints that are not accumulated.
+    pub(crate) fn zigzag(buf: &'a [u8]) -> PackedVarints<'a> {
+        PackedVarints::new(buf, Packing::Zigzag)
     }
 
     /// Returns the next decoded value, or `None` when the array is exhausted.
     #[inline]
     pub(crate) fn next_value(&mut self) -> Option<i64> {
         let raw = read_varint_opt(self.buf, &mut self.pos)?;
-        if self.delta {
-            self.current = self.current.wrapping_add(zigzag(raw));
-            Some(self.current)
-        } else {
-            Some(raw as i64)
+        match self.packing {
+            Packing::Plain => Some(raw as i64),
+            Packing::Zigzag => Some(zigzag(raw)),
+            Packing::Delta => {
+                self.current = self.current.wrapping_add(zigzag(raw));
+                Some(self.current)
+            }
         }
     }
 
     /// Upper bound for the number of remaining values.
     pub(crate) fn upper_bound(&self) -> usize {
         self.buf.len() - self.pos
+    }
+}
+
+impl Iterator for PackedVarints<'_> {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_value()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.upper_bound()))
     }
 }

@@ -4,15 +4,14 @@
 //! those arrays, the iterators here keep one cursor per array and decode the
 //! values on demand, so a block costs no per-element allocation.
 
-use crate::block::{get_stringtable_key_value, str_from_stringtable};
+use crate::block::{PrimitiveBlock, get_stringtable_key_value, str_from_stringtable};
 use crate::error::Result;
-use crate::proto::osmformat;
 use crate::wire::{FieldIter, PackedVarints, WireValue, read_varint_opt};
 
 /// An OpenStreetMap node element from a compressed array of dense nodes (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Node)).
 #[derive(Clone, Debug)]
 pub struct DenseNode<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
 
     /// The node id. It should be unique between nodes and might be negative to indicate
     /// that the element has not yet been uploaded to a server.
@@ -82,7 +81,7 @@ impl<'a> DenseNode<'a> {
     /// Returns an iterator over the tags of this node
     /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
     /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// [`PrimitiveBlock`].
     pub fn raw_tags(&self) -> DenseRawTagIter<'a> {
         DenseRawTagIter {
             keys_vals: self.keys_vals,
@@ -94,7 +93,7 @@ impl<'a> DenseNode<'a> {
 /// An iterator over dense nodes. It decodes the delta encoded values.
 #[derive(Clone, Debug)]
 pub struct DenseNodeIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
     ids: PackedVarints<'a>,
     lats: PackedVarints<'a>,
     lons: PackedVarints<'a>,
@@ -105,10 +104,7 @@ pub struct DenseNodeIter<'a> {
 
 impl<'a> DenseNodeIter<'a> {
     /// Creates an iterator over the `DenseNodes` message in `dense`.
-    pub(crate) fn from_wire(
-        block: &'a osmformat::PrimitiveBlock,
-        dense: &'a [u8],
-    ) -> DenseNodeIter<'a> {
+    pub(crate) fn from_wire(block: &'a PrimitiveBlock, dense: &'a [u8]) -> DenseNodeIter<'a> {
         let mut ids: &[u8] = &[];
         let mut lats: &[u8] = &[];
         let mut lons: &[u8] = &[];
@@ -143,7 +139,7 @@ impl<'a> DenseNodeIter<'a> {
     }
 
     /// Creates an iterator that yields nothing.
-    pub(crate) fn empty(block: &'a osmformat::PrimitiveBlock) -> DenseNodeIter<'a> {
+    pub(crate) fn empty(block: &'a PrimitiveBlock) -> DenseNodeIter<'a> {
         DenseNodeIter {
             block,
             ids: PackedVarints::delta(&[]),
@@ -216,7 +212,7 @@ fn scan_tags(buf: &[u8], start: usize) -> (&[u8], usize) {
 /// Optional metadata with non-geographic information about a dense node
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfo<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
     /// The version of this element.
     version: i32,
     /// Timestamp
@@ -273,7 +269,7 @@ impl<'a> DenseNodeInfo<'a> {
 /// An iterator over dense nodes info. It decodes the delta encoded values.
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfoIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
     versions: PackedVarints<'a>,
     timestamps: PackedVarints<'a>,
     changesets: PackedVarints<'a>,
@@ -284,10 +280,7 @@ pub struct DenseNodeInfoIter<'a> {
 
 impl<'a> DenseNodeInfoIter<'a> {
     /// Creates an iterator over a `DenseInfo` message.
-    pub(crate) fn from_wire(
-        block: &'a osmformat::PrimitiveBlock,
-        info: &'a [u8],
-    ) -> DenseNodeInfoIter<'a> {
+    pub(crate) fn from_wire(block: &'a PrimitiveBlock, info: &'a [u8]) -> DenseNodeInfoIter<'a> {
         let mut versions: &[u8] = &[];
         let mut timestamps: &[u8] = &[];
         let mut changesets: &[u8] = &[];
@@ -353,7 +346,7 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
 /// exactly.
 #[derive(Clone, Debug)]
 pub struct DenseTagIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
     keys_vals: &'a [u8],
     pos: usize,
 }
@@ -390,7 +383,7 @@ impl<'a> Iterator for DenseTagIter<'a> {
 }
 
 /// An iterator over the tags of a node. It returns a pair of indices (key and value) to the
-/// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+/// stringtable of the current [`PrimitiveBlock`].
 #[derive(Clone, Debug)]
 pub struct DenseRawTagIter<'a> {
     keys_vals: &'a [u8],

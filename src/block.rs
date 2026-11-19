@@ -2,99 +2,109 @@
 
 use crate::dense::DenseNodeIter;
 use crate::elements::{Element, Node, Relation, Way};
-use crate::error::{ErrorKind, Result, new_error, new_protobuf_error};
-use crate::proto::osmformat;
-use crate::wire::{FieldIter, WireValue};
-use protobuf::Message;
-use std;
+use crate::error::{ErrorKind, Result, new_error};
+use crate::wire::{FieldIter, WireValue, read_varint};
+use std::ops::Range;
 
 /// A `HeaderBlock`. It contains metadata about following [`PrimitiveBlock`]s.
 #[derive(Clone, Debug)]
 pub struct HeaderBlock {
-    header: osmformat::HeaderBlock,
+    bbox: Option<HeaderBBox>,
+    required_features: Vec<String>,
+    optional_features: Vec<String>,
+    writingprogram: Option<String>,
+    source: Option<String>,
+    osmosis_replication_timestamp: Option<i64>,
+    osmosis_replication_sequence_number: Option<i64>,
+    osmosis_replication_base_url: Option<String>,
 }
 
 impl HeaderBlock {
-    pub(crate) fn new(header: osmformat::HeaderBlock) -> HeaderBlock {
-        HeaderBlock { header }
+    /// Parses a serialized `HeaderBlock`.
+    pub(crate) fn parse(data: &[u8]) -> Result<HeaderBlock> {
+        let mut header = HeaderBlock {
+            bbox: None,
+            required_features: Vec::new(),
+            optional_features: Vec::new(),
+            writingprogram: None,
+            source: None,
+            osmosis_replication_timestamp: None,
+            osmosis_replication_sequence_number: None,
+            osmosis_replication_base_url: None,
+        };
+
+        let mut fields = FieldIter::new(data);
+        while let Some((field, value)) = fields.next_field()? {
+            match (field, value) {
+                (1, WireValue::Bytes(bytes)) => header.bbox = Some(HeaderBBox::parse(bytes)?),
+                (4, WireValue::Bytes(bytes)) => {
+                    header.required_features.push(utf8(bytes)?);
+                }
+                (5, WireValue::Bytes(bytes)) => {
+                    header.optional_features.push(utf8(bytes)?);
+                }
+                (16, WireValue::Bytes(bytes)) => header.writingprogram = Some(utf8(bytes)?),
+                (17, WireValue::Bytes(bytes)) => header.source = Some(utf8(bytes)?),
+                (32, WireValue::Varint(value)) => {
+                    header.osmosis_replication_timestamp = Some(value as i64)
+                }
+                (33, WireValue::Varint(value)) => {
+                    header.osmosis_replication_sequence_number = Some(value as i64)
+                }
+                (34, WireValue::Bytes(bytes)) => {
+                    header.osmosis_replication_base_url = Some(utf8(bytes)?)
+                }
+                _ => {}
+            }
+        }
+
+        Ok(header)
     }
 
     /// Returns the (optional) bounding box of the included features.
     pub fn bbox(&self) -> Option<HeaderBBox> {
-        self.header.bbox.as_ref().map(|bbox| HeaderBBox {
-            left: (bbox.left() as f64) * 1.0_e-9,
-            right: (bbox.right() as f64) * 1.0_e-9,
-            top: (bbox.top() as f64) * 1.0_e-9,
-            bottom: (bbox.bottom() as f64) * 1.0_e-9,
-        })
+        self.bbox.clone()
     }
 
     /// Returns a list of required features that a parser needs to implement to parse the following
     /// [`PrimitiveBlock`]s.
     pub fn required_features(&self) -> &[String] {
-        self.header.required_features.as_slice()
+        self.required_features.as_slice()
     }
 
     /// Returns a list of optional features that a parser can choose to ignore.
     pub fn optional_features(&self) -> &[String] {
-        self.header.optional_features.as_slice()
+        self.optional_features.as_slice()
     }
 
     /// Returns the name of the program that generated the file or `None` if unset.
     pub fn writing_program(&self) -> Option<&str> {
-        if self.header.has_writingprogram() {
-            Some(self.header.writingprogram())
-        } else {
-            None
-        }
+        self.writingprogram.as_deref()
     }
 
     /// Returns the source of the `bbox` field or `None` if unset.
     pub fn source(&self) -> Option<&str> {
-        if self.header.has_source() {
-            Some(self.header.source())
-        } else {
-            None
-        }
+        self.source.as_deref()
     }
 
     /// Returns the replication timestamp of the file, or `None` if unset.
     /// The timestamp is expressed in seconds since the UNIX epoch.
     pub fn osmosis_replication_timestamp(&self) -> Option<i64> {
-        if self.header.has_osmosis_replication_timestamp() {
-            Some(self.header.osmosis_replication_timestamp())
-        } else {
-            None
-        }
+        self.osmosis_replication_timestamp
     }
 
     /// Returns the replication sequence number of the file, or `None` if unset.
     pub fn osmosis_replication_sequence_number(&self) -> Option<i64> {
-        if self.header.has_osmosis_replication_sequence_number() {
-            Some(self.header.osmosis_replication_sequence_number())
-        } else {
-            None
-        }
+        self.osmosis_replication_sequence_number
     }
 
     /// Returns the replication base URL of the file, or `None` if unset.
     pub fn osmosis_replication_base_url(&self) -> Option<&str> {
-        if self.header.has_osmosis_replication_base_url() {
-            Some(self.header.osmosis_replication_base_url())
-        } else {
-            None
-        }
+        self.osmosis_replication_base_url.as_deref()
     }
 }
 
-/// A bounding box that is usually included in a [`HeaderBlock`].
-/// The maximum precision of the coordinates is one nanodegree (10⁻⁹).
-///
-/// The field names follow the OSM API `bbox` convention, which is used by the
-/// writers of the format: `left`/`right` are the west/east edges and
-/// `top`/`bottom` are the north/south edges. So `top` holds the *maximum*
-/// latitude and `bottom` the *minimum* latitude, which is the opposite of what
-/// the words suggest when read as a rectangle on screen.
+/// Controls its visibility of an element.
 #[derive(Clone, Debug)]
 pub struct HeaderBBox {
     /// left coordinate in degrees (minimum longitude, west edge)
@@ -107,37 +117,74 @@ pub struct HeaderBBox {
     pub bottom: f64,
 }
 
+impl HeaderBBox {
+    /// Parses a serialized `HeaderBBox` message.
+    fn parse(data: &[u8]) -> Result<HeaderBBox> {
+        let mut left = None;
+        let mut right = None;
+        let mut top = None;
+        let mut bottom = None;
+
+        let mut fields = FieldIter::new(data);
+        while let Some((field, value)) = fields.next_field()? {
+            if let WireValue::Varint(value) = value {
+                let value = crate::wire::zigzag(value);
+                match field {
+                    1 => left = Some(value),
+                    2 => right = Some(value),
+                    3 => top = Some(value),
+                    4 => bottom = Some(value),
+                    _ => {}
+                }
+            }
+        }
+
+        let missing = || {
+            new_error(ErrorKind::MalformedBlock {
+                reason: "header bbox is missing a required field",
+            })
+        };
+
+        Ok(HeaderBBox {
+            left: (left.ok_or_else(missing)? as f64) * 1.0_e-9,
+            right: (right.ok_or_else(missing)? as f64) * 1.0_e-9,
+            top: (top.ok_or_else(missing)? as f64) * 1.0_e-9,
+            bottom: (bottom.ok_or_else(missing)? as f64) * 1.0_e-9,
+        })
+    }
+}
+
 /// A `PrimitiveBlock`. It contains a sequence of groups.
 #[derive(Clone, Debug)]
 pub struct PrimitiveBlock {
-    /// Block-wide fields: string table, granularity, coordinate offsets. Its
-    /// `primitivegroup` field is always empty; groups are stored separately so
-    /// that dense nodes can be decoded straight from the wire.
-    block: osmformat::PrimitiveBlock,
-    groups: Vec<GroupData>,
+    /// The whole decompressed block. Groups and elements are slices into it.
+    data: Vec<u8>,
+    /// The string table, decoded eagerly: it is small and indexed by every tag.
+    strings: Vec<Vec<u8>>,
+    granularity: i32,
+    lat_offset: i64,
+    lon_offset: i64,
+    date_granularity: i32,
+    groups: Vec<GroupInfo>,
 }
 
-/// How one group of a [`PrimitiveBlock`] is stored.
+/// Where a group lives in the block, and how many elements it holds.
 #[derive(Clone, Debug)]
-enum GroupData {
-    /// A group whose dense nodes are decoded on demand from the wire format.
-    /// `other` is only set for a group that mixes dense nodes with other
-    /// elements, which the format does not produce but a malformed file might.
-    Dense {
-        dense: Vec<u8>,
-        other: Option<osmformat::PrimitiveGroup>,
-    },
-    /// A group decoded with protobuf.
-    Proto(osmformat::PrimitiveGroup),
+struct GroupInfo {
+    range: Range<usize>,
+    nodes: usize,
+    ways: usize,
+    relations: usize,
+    has_dense: bool,
 }
 
 impl PrimitiveBlock {
     /// Parses a serialized `PrimitiveBlock`.
     ///
     /// The string table and the block-wide parameters are decoded eagerly (they
-    /// are small); dense node arrays stay in their wire format and are decoded
-    /// element by element.
-    pub(crate) fn parse(data: &[u8]) -> Result<PrimitiveBlock> {
+    /// are small); elements stay in their wire format and are decoded one at a
+    /// time.
+    pub(crate) fn parse(data: Vec<u8>) -> Result<PrimitiveBlock> {
         let mut strings = Vec::new();
         let mut granularity = 100;
         let mut lat_offset = 0;
@@ -146,27 +193,43 @@ impl PrimitiveBlock {
         let mut groups = Vec::new();
         let mut has_stringtable = false;
 
-        let mut fields = FieldIter::new(data);
-        while let Some((field, value)) = fields.next_field()? {
-            match (field, value) {
-                (1, WireValue::Bytes(bytes)) => {
-                    strings = parse_string_table(bytes)?;
-                    has_stringtable = true;
+        let mut pos = 0;
+        while pos < data.len() {
+            let tag = read_varint(&data, &mut pos)?;
+            let field = tag >> 3;
+            match tag & 7 {
+                0 => {
+                    let value = read_varint(&data, &mut pos)?;
+                    match field {
+                        17 => granularity = value as i32,
+                        18 => date_granularity = value as i32,
+                        19 => lat_offset = value as i64,
+                        20 => lon_offset = value as i64,
+                        _ => {}
+                    }
                 }
-                (2, WireValue::Bytes(bytes)) => groups.push(parse_group(bytes)?),
-                (17, WireValue::Varint(value)) => granularity = value as i32,
-                (18, WireValue::Varint(value)) => date_granularity = value as i32,
-                (19, WireValue::Varint(value)) => lat_offset = value as i64,
-                (20, WireValue::Varint(value)) => lon_offset = value as i64,
-                // A known field with the wrong wire type means this is not a
-                // `PrimitiveBlock` at all (for example a header blob fed to
-                // `to_primitiveblock`), so fail instead of misreading it.
-                (1 | 2, WireValue::Varint(_)) | (17..=20, WireValue::Bytes(_)) => {
-                    return Err(malformed_block("unexpected wire type"));
+                2 => {
+                    let len = read_varint(&data, &mut pos)? as usize;
+                    let start = pos;
+                    let end = start
+                        .checked_add(len)
+                        .ok_or_else(|| malformed_block("field length overflows"))?;
+                    if end > data.len() {
+                        return Err(malformed_block("truncated field"));
+                    }
+                    pos = end;
+                    match field {
+                        1 => {
+                            strings = parse_string_table(&data[start..end])?;
+                            has_stringtable = true;
+                        }
+                        2 => groups.push(parse_group_info(start..end, &data[start..end])?),
+                        _ => {}
+                    }
                 }
-                // Unknown fields are skipped on purpose: the format is allowed
-                // to grow, and a future field must not make old readers fail.
-                _ => {}
+                1 => pos += 8,
+                5 => pos += 4,
+                _ => return Err(malformed_block("unexpected wire type")),
             }
         }
 
@@ -176,27 +239,45 @@ impl PrimitiveBlock {
             return Err(malformed_block("missing required stringtable"));
         }
 
-        let mut block = osmformat::PrimitiveBlock::new();
-        block.stringtable = protobuf::MessageField::some(osmformat::StringTable {
-            s: strings,
-            ..Default::default()
-        });
-        block.granularity = Some(granularity);
-        block.lat_offset = Some(lat_offset);
-        block.lon_offset = Some(lon_offset);
-        block.date_granularity = Some(date_granularity);
+        Ok(PrimitiveBlock {
+            data,
+            strings,
+            granularity,
+            lat_offset,
+            lon_offset,
+            date_granularity,
+            groups,
+        })
+    }
 
-        Ok(PrimitiveBlock { block, groups })
+    /// Returns the granularity of coordinates in nanodegrees.
+    pub(crate) fn granularity(&self) -> i32 {
+        self.granularity
+    }
+
+    /// Returns the latitude offset in nanodegrees.
+    pub(crate) fn lat_offset(&self) -> i64 {
+        self.lat_offset
+    }
+
+    /// Returns the longitude offset in nanodegrees.
+    pub(crate) fn lon_offset(&self) -> i64 {
+        self.lon_offset
+    }
+
+    /// Returns the granularity of timestamps in milliseconds.
+    pub(crate) fn date_granularity(&self) -> i32 {
+        self.date_granularity
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`.
     pub fn elements(&self) -> BlockElementsIter<'_> {
-        BlockElementsIter::new(&self.block, &self.groups)
+        BlockElementsIter::new(self)
     }
 
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
-        GroupIter::new(&self.block, &self.groups)
+        GroupIter::new(self)
     }
 
     /// Calls the given closure on each element.
@@ -225,7 +306,7 @@ impl PrimitiveBlock {
     /// contained strings are UTF-8 encoded but it is not safe to assume that (use
     /// `std::str::from_utf8`).
     pub fn raw_stringtable(&self) -> &[Vec<u8>] {
-        self.block.stringtable.s.as_slice()
+        self.strings.as_slice()
     }
 }
 
@@ -243,35 +324,34 @@ fn parse_string_table(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(strings)
 }
 
-/// Decides how a `PrimitiveGroup` should be stored.
-fn parse_group(data: &[u8]) -> Result<GroupData> {
-    let mut dense: Option<&[u8]> = None;
-    let mut has_other = false;
+/// Counts the elements of one group and checks its dense arrays.
+fn parse_group_info(range: Range<usize>, data: &[u8]) -> Result<GroupInfo> {
+    let mut nodes = 0;
+    let mut ways = 0;
+    let mut relations = 0;
+    let mut has_dense = false;
 
     let mut fields = FieldIter::new(data);
     while let Some((field, value)) = fields.next_field()? {
         match (field, value) {
-            (2, WireValue::Bytes(bytes)) => dense = Some(bytes),
-            (1 | 3 | 4 | 5, _) => has_other = true,
+            (1, WireValue::Bytes(_)) => nodes += 1,
+            (2, WireValue::Bytes(bytes)) => {
+                has_dense = true;
+                validate_dense(bytes)?;
+            }
+            (3, WireValue::Bytes(_)) => ways += 1,
+            (4, WireValue::Bytes(_)) => relations += 1,
             _ => {}
         }
     }
 
-    match dense {
-        None => Ok(GroupData::Proto(parse_primitive_group(data)?)),
-        Some(dense) => {
-            validate_dense(dense)?;
-            let other = if has_other {
-                Some(parse_primitive_group(data)?)
-            } else {
-                None
-            };
-            Ok(GroupData::Dense {
-                dense: dense.to_vec(),
-                other,
-            })
-        }
-    }
+    Ok(GroupInfo {
+        range,
+        nodes,
+        ways,
+        relations,
+        has_dense,
+    })
 }
 
 /// Rejects dense node arrays that are not packed.
@@ -295,90 +375,72 @@ fn malformed_block(reason: &'static str) -> crate::error::Error {
     new_error(ErrorKind::MalformedBlock { reason })
 }
 
-/// Decodes a whole `PrimitiveGroup` with protobuf.
-fn parse_primitive_group(data: &[u8]) -> Result<osmformat::PrimitiveGroup> {
-    osmformat::PrimitiveGroup::parse_from_bytes(data)
-        .map_err(|error| new_protobuf_error(error, "primitive group"))
+/// Decodes a length-delimited string field as UTF-8.
+fn utf8(bytes: &[u8]) -> Result<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_owned()),
+        Err(_) => Err(malformed_block("string field is not valid UTF-8")),
+    }
 }
 
 /// A `PrimitiveGroup` contains a sequence of elements of one type.
 #[derive(Clone, Debug)]
 pub struct PrimitiveGroup<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    data: &'a GroupData,
+    block: &'a PrimitiveBlock,
+    info: &'a GroupInfo,
 }
 
 impl<'a> PrimitiveGroup<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock, data: &'a GroupData) -> PrimitiveGroup<'a> {
-        PrimitiveGroup { block, data }
+    /// Creates a group view.
+    fn new(block: &'a PrimitiveBlock, info: &'a GroupInfo) -> PrimitiveGroup<'a> {
+        PrimitiveGroup { block, info }
     }
 
-    /// Elements of this group that were decoded with protobuf, if any.
-    fn proto(&self) -> Option<&'a osmformat::PrimitiveGroup> {
-        match self.data {
-            GroupData::Dense { other, .. } => other.as_ref(),
-            GroupData::Proto(group) => Some(group),
-        }
-    }
-
-    /// The nodes of this group, or an empty slice for a dense group.
-    fn node_slice(&self) -> &'a [osmformat::Node] {
-        match self.proto() {
-            Some(group) => group.nodes.as_slice(),
-            None => &[],
-        }
-    }
-
-    /// The ways of this group, or an empty slice for a dense group.
-    fn way_slice(&self) -> &'a [osmformat::Way] {
-        match self.proto() {
-            Some(group) => group.ways.as_slice(),
-            None => &[],
-        }
-    }
-
-    /// The relations of this group, or an empty slice for a dense group.
-    fn relation_slice(&self) -> &'a [osmformat::Relation] {
-        match self.proto() {
-            Some(group) => group.relations.as_slice(),
-            None => &[],
-        }
+    /// The serialized group this view refers to.
+    fn bytes(&self) -> &'a [u8] {
+        &self.block.data[self.info.range.clone()]
     }
 
     /// Returns an iterator over the nodes in this group.
     pub fn nodes(&self) -> GroupNodeIter<'a> {
-        GroupNodeIter::new(self.block, self.node_slice())
+        GroupNodeIter::new(self.block, self.bytes(), self.info.nodes)
     }
 
     /// Returns an iterator over the dense nodes in this group.
     pub fn dense_nodes(&self) -> DenseNodeIter<'a> {
-        match self.data {
-            GroupData::Dense { dense, .. } => DenseNodeIter::from_wire(self.block, dense),
-            GroupData::Proto(_) => DenseNodeIter::empty(self.block),
+        if !self.info.has_dense {
+            return DenseNodeIter::empty(self.block);
         }
+        let mut fields = FieldIter::new(self.bytes());
+        while let Ok(Some((field, value))) = fields.next_field() {
+            if let (2, WireValue::Bytes(bytes)) = (field, value) {
+                return DenseNodeIter::from_wire(self.block, bytes);
+            }
+        }
+        DenseNodeIter::empty(self.block)
     }
 
     /// Returns an iterator over the ways in this group.
     pub fn ways(&self) -> GroupWayIter<'a> {
-        GroupWayIter::new(self.block, self.way_slice())
+        GroupWayIter::new(self.block, self.bytes(), self.info.ways)
     }
 
     /// Returns an iterator over the relations in this group.
     pub fn relations(&self) -> GroupRelationIter<'a> {
-        GroupRelationIter::new(self.block, self.relation_slice())
+        GroupRelationIter::new(self.block, self.bytes(), self.info.relations)
     }
 }
 
 /// An iterator over the elements in a [`PrimitiveGroup`].
 #[derive(Clone, Debug)]
 pub struct BlockElementsIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
+    block: &'a PrimitiveBlock,
     state: ElementsIterState,
-    groups: std::slice::Iter<'a, GroupData>,
+    groups: std::slice::Iter<'a, GroupInfo>,
     dense_nodes: DenseNodeIter<'a>,
-    nodes: std::slice::Iter<'a, osmformat::Node>,
-    ways: std::slice::Iter<'a, osmformat::Way>,
-    relations: std::slice::Iter<'a, osmformat::Relation>,
+    nodes: GroupNodeIter<'a>,
+    ways: GroupWayIter<'a>,
+    relations: GroupRelationIter<'a>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -391,15 +453,15 @@ enum ElementsIterState {
 }
 
 impl<'a> BlockElementsIter<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock, groups: &'a [GroupData]) -> BlockElementsIter<'a> {
+    fn new(block: &'a PrimitiveBlock) -> BlockElementsIter<'a> {
         BlockElementsIter {
             block,
             state: ElementsIterState::Group,
-            groups: groups.iter(),
+            groups: block.groups.iter(),
             dense_nodes: DenseNodeIter::empty(block),
-            nodes: [].iter(),
-            ways: [].iter(),
-            relations: [].iter(),
+            nodes: GroupNodeIter::empty(block),
+            ways: GroupWayIter::empty(block),
+            relations: GroupRelationIter::empty(block),
         }
     }
 
@@ -410,13 +472,13 @@ impl<'a> BlockElementsIter<'a> {
     fn step(&mut self) -> Option<Option<Element<'a>>> {
         match self.state {
             ElementsIterState::Group => match self.groups.next() {
-                Some(data) => {
-                    let group = PrimitiveGroup::new(self.block, data);
+                Some(info) => {
+                    let group = PrimitiveGroup::new(self.block, info);
                     self.state = ElementsIterState::DenseNode;
                     self.dense_nodes = group.dense_nodes();
-                    self.nodes = group.node_slice().iter();
-                    self.ways = group.way_slice().iter();
-                    self.relations = group.relation_slice().iter();
+                    self.nodes = group.nodes();
+                    self.ways = group.ways();
+                    self.relations = group.relations();
                     None
                 }
                 None => Some(None),
@@ -429,21 +491,21 @@ impl<'a> BlockElementsIter<'a> {
                 }
             },
             ElementsIterState::Node => match self.nodes.next() {
-                Some(node) => Some(Some(Element::Node(Node::new(self.block, node)))),
+                Some(node) => Some(Some(Element::Node(node))),
                 None => {
                     self.state = ElementsIterState::Way;
                     None
                 }
             },
             ElementsIterState::Way => match self.ways.next() {
-                Some(way) => Some(Some(Element::Way(Way::new(self.block, way)))),
+                Some(way) => Some(Some(Element::Way(way))),
                 None => {
                     self.state = ElementsIterState::Relation;
                     None
                 }
             },
             ElementsIterState::Relation => match self.relations.next() {
-                Some(rel) => Some(Some(Element::Relation(Relation::new(self.block, rel)))),
+                Some(rel) => Some(Some(Element::Relation(rel))),
                 None => {
                     self.state = ElementsIterState::Group;
                     None
@@ -469,15 +531,15 @@ impl<'a> Iterator for BlockElementsIter<'a> {
 /// An iterator over the groups in a [`PrimitiveBlock`].
 #[derive(Clone, Debug)]
 pub struct GroupIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    groups: std::slice::Iter<'a, GroupData>,
+    block: &'a PrimitiveBlock,
+    groups: std::slice::Iter<'a, GroupInfo>,
 }
 
 impl<'a> GroupIter<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock, groups: &'a [GroupData]) -> GroupIter<'a> {
+    fn new(block: &'a PrimitiveBlock) -> GroupIter<'a> {
         GroupIter {
             block,
-            groups: groups.iter(),
+            groups: block.groups.iter(),
         }
     }
 }
@@ -487,7 +549,7 @@ impl<'a> Iterator for GroupIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.groups.next() {
-            Some(data) => Some(PrimitiveGroup::new(self.block, data)),
+            Some(info) => Some(PrimitiveGroup::new(self.block, info)),
             None => None,
         }
     }
@@ -502,18 +564,25 @@ impl ExactSizeIterator for GroupIter<'_> {}
 /// An iterator over the nodes in a [`PrimitiveGroup`].
 #[derive(Clone, Debug)]
 pub struct GroupNodeIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    nodes: std::slice::Iter<'a, osmformat::Node>,
+    block: &'a PrimitiveBlock,
+    fields: FieldIter<'a>,
+    remaining: usize,
 }
 
 impl<'a> GroupNodeIter<'a> {
-    fn new(
-        block: &'a osmformat::PrimitiveBlock,
-        nodes: &'a [osmformat::Node],
-    ) -> GroupNodeIter<'a> {
+    fn new(block: &'a PrimitiveBlock, data: &'a [u8], remaining: usize) -> GroupNodeIter<'a> {
         GroupNodeIter {
             block,
-            nodes: nodes.iter(),
+            fields: FieldIter::new(data),
+            remaining,
+        }
+    }
+
+    fn empty(block: &'a PrimitiveBlock) -> GroupNodeIter<'a> {
+        GroupNodeIter {
+            block,
+            fields: FieldIter::new(&[]),
+            remaining: 0,
         }
     }
 }
@@ -522,14 +591,20 @@ impl<'a> Iterator for GroupNodeIter<'a> {
     type Item = Node<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.nodes.next() {
-            Some(n) => Some(Node::new(self.block, n)),
-            None => None,
+        loop {
+            match self.fields.next_field() {
+                Ok(Some((1, WireValue::Bytes(bytes)))) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    return Some(Node::from_wire(self.block, bytes));
+                }
+                Ok(Some(_)) => {}
+                _ => return None,
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.nodes.size_hint()
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -538,15 +613,25 @@ impl ExactSizeIterator for GroupNodeIter<'_> {}
 /// An iterator over the ways in a [`PrimitiveGroup`].
 #[derive(Clone, Debug)]
 pub struct GroupWayIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    ways: std::slice::Iter<'a, osmformat::Way>,
+    block: &'a PrimitiveBlock,
+    fields: FieldIter<'a>,
+    remaining: usize,
 }
 
 impl<'a> GroupWayIter<'a> {
-    fn new(block: &'a osmformat::PrimitiveBlock, ways: &'a [osmformat::Way]) -> GroupWayIter<'a> {
+    fn new(block: &'a PrimitiveBlock, data: &'a [u8], remaining: usize) -> GroupWayIter<'a> {
         GroupWayIter {
             block,
-            ways: ways.iter(),
+            fields: FieldIter::new(data),
+            remaining,
+        }
+    }
+
+    fn empty(block: &'a PrimitiveBlock) -> GroupWayIter<'a> {
+        GroupWayIter {
+            block,
+            fields: FieldIter::new(&[]),
+            remaining: 0,
         }
     }
 }
@@ -555,14 +640,20 @@ impl<'a> Iterator for GroupWayIter<'a> {
     type Item = Way<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.ways.next() {
-            Some(way) => Some(Way::new(self.block, way)),
-            None => None,
+        loop {
+            match self.fields.next_field() {
+                Ok(Some((3, WireValue::Bytes(bytes)))) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    return Some(Way::from_wire(self.block, bytes));
+                }
+                Ok(Some(_)) => {}
+                _ => return None,
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.ways.size_hint()
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -571,18 +662,25 @@ impl ExactSizeIterator for GroupWayIter<'_> {}
 /// An iterator over the relations in a [`PrimitiveGroup`].
 #[derive(Clone, Debug)]
 pub struct GroupRelationIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    rels: std::slice::Iter<'a, osmformat::Relation>,
+    block: &'a PrimitiveBlock,
+    fields: FieldIter<'a>,
+    remaining: usize,
 }
 
 impl<'a> GroupRelationIter<'a> {
-    fn new(
-        block: &'a osmformat::PrimitiveBlock,
-        relations: &'a [osmformat::Relation],
-    ) -> GroupRelationIter<'a> {
+    fn new(block: &'a PrimitiveBlock, data: &'a [u8], remaining: usize) -> GroupRelationIter<'a> {
         GroupRelationIter {
             block,
-            rels: relations.iter(),
+            fields: FieldIter::new(data),
+            remaining,
+        }
+    }
+
+    fn empty(block: &'a PrimitiveBlock) -> GroupRelationIter<'a> {
+        GroupRelationIter {
+            block,
+            fields: FieldIter::new(&[]),
+            remaining: 0,
         }
     }
 }
@@ -591,24 +689,28 @@ impl<'a> Iterator for GroupRelationIter<'a> {
     type Item = Relation<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.rels.next() {
-            Some(rel) => Some(Relation::new(self.block, rel)),
-            None => None,
+        loop {
+            match self.fields.next_field() {
+                Ok(Some((4, WireValue::Bytes(bytes)))) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    return Some(Relation::from_wire(self.block, bytes));
+                }
+                Ok(Some(_)) => {}
+                _ => return None,
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.rels.size_hint()
+        (self.remaining, Some(self.remaining))
     }
 }
 
 impl ExactSizeIterator for GroupRelationIter<'_> {}
 
-pub(crate) fn str_from_stringtable(
-    block: &osmformat::PrimitiveBlock,
-    index: usize,
-) -> Result<&str> {
-    if let Some(vec) = block.stringtable.s.get(index) {
+/// Looks up a string in the string table of a block.
+pub(crate) fn str_from_stringtable(block: &PrimitiveBlock, index: usize) -> Result<&str> {
+    if let Some(vec) = block.strings.get(index) {
         std::str::from_utf8(vec)
             .map_err(|e| new_error(ErrorKind::StringtableUtf8 { err: e, index }))
     } else {
@@ -618,7 +720,7 @@ pub(crate) fn str_from_stringtable(
 
 /// Construct a key-value tuple from key/value indexes, using the stringtable from a block.
 pub(crate) fn get_stringtable_key_value(
-    block: &osmformat::PrimitiveBlock,
+    block: &PrimitiveBlock,
     key_index: Option<usize>,
     value_index: Option<usize>,
 ) -> Option<(&str, &str)> {

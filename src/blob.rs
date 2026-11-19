@@ -1,13 +1,11 @@
 //! Read and decode blobs
 
 use crate::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{
-    BlobError, Error, ErrorKind, Result, new_blob_error, new_error, new_protobuf_error,
-};
-use crate::proto::fileformat;
-use protobuf::Message;
+use crate::error::{BlobError, Error, ErrorKind, Result, new_blob_error, new_error};
+use crate::wire::{FieldIter, WireValue};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::Path;
 
 use flate2::read::ZlibDecoder;
@@ -34,6 +32,7 @@ pub enum BlobType<'a> {
 }
 
 impl<'a> BlobType<'a> {
+    /// Returns the identifier as it appears in the file.
     pub const fn as_str(&self) -> &'a str {
         match self {
             Self::OsmHeader => "OSMHeader",
@@ -43,7 +42,6 @@ impl<'a> BlobType<'a> {
     }
 }
 
-//TODO rename variants to fit proto files
 /// The decoded content of a blob (analogous to [`BlobType`]).
 #[derive(Clone, Debug)]
 pub enum BlobDecode<'a> {
@@ -60,28 +58,61 @@ pub enum BlobDecode<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ByteOffset(pub u64);
 
+/// Where the payload of a blob lives, and how it is compressed.
+#[derive(Clone, Debug)]
+enum Payload {
+    /// Uncompressed bytes at the given range of the blob message.
+    Raw(Range<usize>),
+    /// zlib compressed bytes at the given range.
+    Zlib(Range<usize>),
+    /// A compression format the format defines but this crate does not decode.
+    Unsupported(&'static str),
+    /// Neither `raw` nor a compression field is set.
+    Missing,
+}
+
 /// A blob.
 ///
 /// A PBF file consists of a sequence of blobs. This type supports decoding the content of a blob
 /// to different types of blocks that are usually more interesting to the user.
 #[derive(Clone, Debug)]
 pub struct Blob {
-    header: fileformat::BlobHeader,
-    blob: fileformat::Blob,
+    /// The serialized `Blob` message.
+    data: Vec<u8>,
+    /// Where the payload is inside `data`.
+    payload: Payload,
+    /// The type string taken from the preceding blob header.
+    type_: String,
     offset: Option<ByteOffset>,
 }
 
 impl Blob {
-    fn new(
-        header: fileformat::BlobHeader,
-        blob: fileformat::Blob,
-        offset: Option<ByteOffset>,
-    ) -> Blob {
-        Blob {
-            header,
-            blob,
-            offset,
+    /// Reads a blob message, recording where its payload lives.
+    fn from_parts(type_: String, data: Vec<u8>, offset: Option<ByteOffset>) -> Result<Blob> {
+        let mut payload = Payload::Missing;
+
+        let mut fields = FieldIter::new(&data);
+        while let Some((field, value)) = fields.next_field()? {
+            if let WireValue::Bytes(bytes) = value {
+                let start = bytes.as_ptr() as usize - data.as_ptr() as usize;
+                let range = start..start + bytes.len();
+                match field {
+                    1 => payload = Payload::Raw(range),
+                    3 => payload = Payload::Zlib(range),
+                    4 => payload = Payload::Unsupported("lzma"),
+                    6 => payload = Payload::Unsupported("lz4"),
+                    7 => payload = Payload::Unsupported("zstd"),
+                    _ => {}
+                }
+            }
         }
+
+        Ok(Blob {
+            data,
+            payload,
+            type_,
+            offset,
+        })
     }
 
     /// Decodes the Blob and tries to obtain the inner content (usually a [`HeaderBlock`] or a
@@ -102,7 +133,7 @@ impl Blob {
 
     /// Returns the type of a blob without decoding its content.
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.type_() {
+        match self.type_.as_str() {
             x if x == BlobType::OsmHeader.as_str() => BlobType::OsmHeader,
             x if x == BlobType::OsmData.as_str() => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -118,14 +149,46 @@ impl Blob {
     /// Tries to decode the blob to a [`HeaderBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_headerblock(&self) -> Result<HeaderBlock> {
-        decode_blob(&self.blob).map(HeaderBlock::new)
+        let payload = self.decompressed()?;
+        HeaderBlock::parse(&payload)
     }
 
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        let payload = blob_payload(&self.blob)?;
-        PrimitiveBlock::parse(&payload)
+        let payload = self.decompressed()?;
+        PrimitiveBlock::parse(payload)
+    }
+
+    /// Returns the uncompressed content of the blob.
+    ///
+    /// The declared size limits are enforced here: an oversized or unsupported
+    /// blob is reported instead of being handed to a parser.
+    fn decompressed(&self) -> Result<Vec<u8>> {
+        match &self.payload {
+            Payload::Raw(range) => {
+                let payload = &self.data[range.clone()];
+                let size = payload.len() as u64;
+                if size < MAX_BLOB_MESSAGE_SIZE {
+                    Ok(payload.to_vec())
+                } else {
+                    Err(new_blob_error(BlobError::MessageTooBig { size }))
+                }
+            }
+            Payload::Zlib(range) => {
+                let mut decoder =
+                    ZlibDecoder::new(&self.data[range.clone()]).take(MAX_BLOB_MESSAGE_SIZE);
+                let mut buffer = Vec::new();
+                decoder.read_to_end(&mut buffer).map_err(Error::from)?;
+                Ok(buffer)
+            }
+            // Recognized by the format, but not implemented here. Reporting
+            // the format explicitly beats claiming that the blob is empty.
+            Payload::Unsupported(kind) => {
+                Err(new_blob_error(BlobError::UnsupportedCompression { kind }))
+            }
+            Payload::Missing => Err(new_blob_error(BlobError::Empty)),
+        }
     }
 }
 
@@ -134,17 +197,43 @@ impl Blob {
 /// Just contains information about the size and type of the following [`Blob`].
 #[derive(Clone, Debug)]
 pub struct BlobHeader {
-    header: fileformat::BlobHeader,
+    type_: String,
+    datasize: i32,
 }
 
 impl BlobHeader {
-    fn new(header: fileformat::BlobHeader) -> Self {
-        BlobHeader { header }
+    /// Parses a serialized `BlobHeader` message.
+    fn parse(data: &[u8]) -> Result<BlobHeader> {
+        let mut type_ = None;
+        let mut datasize = None;
+
+        let mut fields = FieldIter::new(data);
+        while let Some((field, value)) = fields.next_field()? {
+            match (field, value) {
+                (1, WireValue::Bytes(bytes)) => {
+                    let text = std::str::from_utf8(bytes).map_err(|_| {
+                        new_blob_error(BlobError::MalformedHeader {
+                            reason: "blob type is not valid UTF-8",
+                        })
+                    })?;
+                    type_ = Some(text.to_owned());
+                }
+                (3, WireValue::Varint(value)) => datasize = Some(value as i32),
+                _ => {}
+            }
+        }
+
+        match (type_, datasize) {
+            (Some(type_), Some(datasize)) => Ok(BlobHeader { type_, datasize }),
+            _ => Err(new_blob_error(BlobError::MalformedHeader {
+                reason: "blob header is missing a required field",
+            })),
+        }
     }
 
     /// Returns the type of the following blob.
     pub fn blob_type(&self) -> BlobType<'_> {
-        match self.header.type_() {
+        match self.type_.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
             "OSMData" => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -153,7 +242,7 @@ impl BlobHeader {
 
     /// Returns the size of the following blob in bytes.
     pub fn get_blob_size(&self) -> i32 {
-        self.header.datasize()
+        self.datasize
     }
 }
 
@@ -227,7 +316,18 @@ impl<R: Read + Send> BlobReader<R> {
         }
     }
 
-    fn read_blob_header(&mut self) -> Option<Result<fileformat::BlobHeader>> {
+    /// Reads exactly `len` bytes, or reports that the stream ended early.
+    fn read_exact_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(len as usize);
+        let mut reader = self.reader.by_ref().take(len);
+        reader.read_to_end(&mut buffer).map_err(Error::from)?;
+        if buffer.len() as u64 != len {
+            return Err(truncated_stream("content too short"));
+        }
+        Ok(buffer)
+    }
+
+    fn read_blob_header(&mut self) -> Option<Result<BlobHeader>> {
         let header_size = match self.read_header_size() {
             Some(Ok(size)) => size,
             Some(Err(err)) => return Some(Err(err)),
@@ -241,23 +341,23 @@ impl<R: Read + Send> BlobReader<R> {
             })));
         }
 
-        let mut reader = self.reader.by_ref().take(header_size);
-        let header = match fileformat::BlobHeader::parse_from_reader(&mut reader) {
-            Ok(header) => header,
-            Err(e) => {
+        let data = match self.read_exact_bytes(header_size) {
+            Ok(data) => data,
+            Err(err) => {
                 self.offset = None;
                 self.last_blob_ok = false;
-                return Some(Err(new_protobuf_error(e, "blob header")));
+                return Some(Err(err));
             }
         };
 
-        // A message that ends before consuming the announced length means the
-        // file is truncated (or the length is a lie).
-        if reader.limit() != 0 {
-            self.offset = None;
-            self.last_blob_ok = false;
-            return Some(Err(truncated_stream("content too short for header")));
-        }
+        let header = match BlobHeader::parse(&data) {
+            Ok(header) => header,
+            Err(err) => {
+                self.offset = None;
+                self.last_blob_ok = false;
+                return Some(Err(err));
+            }
+        };
 
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
 
@@ -319,27 +419,27 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             }
         };
 
-        let mut reader = self.reader.by_ref().take(data_size);
-        let blob = match fileformat::Blob::parse_from_reader(&mut reader) {
-            Ok(blob) => blob,
-            Err(e) => {
+        let data = match self.read_exact_bytes(data_size) {
+            Ok(data) => data,
+            Err(err) => {
                 self.offset = None;
                 self.last_blob_ok = false;
-                return Some(Err(new_protobuf_error(e, "blob content")));
+                return Some(Err(err));
             }
         };
 
-        // Same as for the header: a message that stops before the announced
-        // length means the stream ended inside the blob.
-        if reader.limit() != 0 {
-            self.offset = None;
-            self.last_blob_ok = false;
-            return Some(Err(truncated_stream("content too short for blob")));
-        }
-
         self.offset = self.offset.map(|x| ByteOffset(x.0 + data_size));
 
-        Some(Ok(Blob::new(header, blob, prev_offset)))
+        let blob = match Blob::from_parts(header.type_.clone(), data, prev_offset) {
+            Ok(blob) => blob,
+            Err(err) => {
+                self.offset = None;
+                self.last_blob_ok = false;
+                return Some(Err(err));
+            }
+        };
+
+        Some(Ok(blob))
     }
 }
 
@@ -489,7 +589,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             return Some(Err(err));
         }
 
-        Some(Ok((BlobHeader::new(header), prev_offset)))
+        Some(Ok((header, prev_offset)))
     }
 }
 
@@ -527,12 +627,12 @@ fn truncated_stream(message: &'static str) -> Error {
 
 /// Validates the `datasize` field of a blob header.
 ///
-/// The format defines `datasize` as the exact length of the serialized
-/// [`fileformat::Blob`] message, which is capped by [`MAX_BLOB_MESSAGE_SIZE`].
-/// A negative or oversized value means the file is corrupt: computing offsets
-/// from it would wrap around and could point anywhere in the stream.
-pub(crate) fn blob_data_size(header: &fileformat::BlobHeader) -> Result<u64> {
-    let size = header.datasize();
+/// The format defines `datasize` as the exact length of the serialized `Blob`
+/// message, which is capped by [`MAX_BLOB_MESSAGE_SIZE`]. A negative or
+/// oversized value means the file is corrupt: computing offsets from it would
+/// wrap around and could point anywhere in the stream.
+pub(crate) fn blob_data_size(header: &BlobHeader) -> Result<u64> {
+    let size = header.datasize;
     if (0..=MAX_BLOB_MESSAGE_SIZE as i32).contains(&size) {
         Ok(size as u64)
     } else {
@@ -540,48 +640,6 @@ pub(crate) fn blob_data_size(header: &fileformat::BlobHeader) -> Result<u64> {
             size: i64::from(size),
         }))
     }
-}
-
-/// Returns the uncompressed content of a blob.
-///
-/// The declared size limits are enforced here: an oversized or unsupported
-/// blob is reported instead of being handed to a parser.
-pub(crate) fn blob_payload(blob: &fileformat::Blob) -> Result<Vec<u8>> {
-    if blob.has_raw() {
-        let size = blob.raw().len() as u64;
-        if size < MAX_BLOB_MESSAGE_SIZE {
-            Ok(blob.raw().to_vec())
-        } else {
-            Err(new_blob_error(BlobError::MessageTooBig { size }))
-        }
-    } else if blob.has_zlib_data() {
-        let mut decoder = ZlibDecoder::new(blob.zlib_data()).take(MAX_BLOB_MESSAGE_SIZE);
-        let mut payload = Vec::new();
-        decoder.read_to_end(&mut payload).map_err(Error::from)?;
-        Ok(payload)
-    } else if blob.has_lz4_data() {
-        // Recognized by the format, but not implemented here. Reporting it
-        // explicitly beats claiming that the blob is empty.
-        Err(new_blob_error(BlobError::UnsupportedCompression {
-            kind: "lz4",
-        }))
-    } else if blob.has_zstd_data() {
-        Err(new_blob_error(BlobError::UnsupportedCompression {
-            kind: "zstd",
-        }))
-    } else if blob.has_lzma_data() {
-        Err(new_blob_error(BlobError::UnsupportedCompression {
-            kind: "lzma",
-        }))
-    } else {
-        Err(new_blob_error(BlobError::Empty))
-    }
-}
-
-/// Decodes the uncompressed content of a blob into a protobuf message.
-pub(crate) fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
-    let payload = blob_payload(blob)?;
-    T::parse_from_bytes(&payload).map_err(|e| new_protobuf_error(e, "blob data"))
 }
 
 #[cfg(test)]
@@ -598,11 +656,7 @@ mod tests {
         ];
 
         for (string, blob_type) in &pairs {
-            let mut ff_header = fileformat::BlobHeader::new();
-            ff_header.set_type(string.to_string());
-            let ff_blob = fileformat::Blob::new();
-
-            let blob = Blob::new(ff_header, ff_blob, None);
+            let blob = Blob::from_parts((*string).to_owned(), Vec::new(), None).unwrap();
             assert_eq!(blob.get_type(), *blob_type);
         }
     }

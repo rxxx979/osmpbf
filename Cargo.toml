@@ -18,15 +18,11 @@ zlib-ng = ["flate2/zlib-ng"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false }
-protobuf = "3.7"
 rayon = "1.12"
 
 [dev-dependencies]
 assert_approx_eq = "1.1.0"
 criterion = { version = "0.8", features = ["html_reports"] }
-
-[build-dependencies]
-protobuf-codegen = "3.7"
 
 [[bench]]
 name = "counter_bench"

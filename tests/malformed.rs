@@ -223,6 +223,11 @@ fn errors_chain_to_their_cause() {
     let mut reader = BlobReader::from_path(POISONED_READER).unwrap();
     reader.next();
     reader.next();
-    let protobuf_err = reader.next().unwrap().unwrap_err();
-    assert!(std::error::Error::source(&protobuf_err).is_some());
+    // Wire-format errors are leaf errors, but they must describe the problem.
+    let malformed = reader.next().unwrap().unwrap_err();
+    let message = malformed.to_string();
+    assert!(
+        message.contains("malformed"),
+        "unexpected error message: {message}"
+    );
 }

@@ -1,12 +1,9 @@
 //! Nodes, ways and relations
 
-use crate::block::{get_stringtable_key_value, str_from_stringtable};
+use crate::block::{PrimitiveBlock, get_stringtable_key_value, str_from_stringtable};
 use crate::dense::DenseNode;
 use crate::error::Result;
-use crate::proto::osmformat;
-use crate::proto::osmformat::PrimitiveBlock;
-use osmformat::relation::MemberType;
-use protobuf::EnumOrUnknown;
+use crate::wire::{FieldIter, PackedVarints, WireValue, zigzag};
 
 /// An enum with the OSM core elements: nodes, ways and relations.
 #[derive(Clone, Debug)]
@@ -16,7 +13,7 @@ pub enum Element<'a> {
 
     /// Just like [`Node`](Self::Node), but with a different representation in memory. This distinction is
     /// usually not important but is not abstracted away to avoid copying. So, if you want to match
-    /// `Node`, you also likely want to match [`DenseNode`].
+    /// `Node`, you also likely want to match [`DenseNode`](Self::DenseNode).
     DenseNode(DenseNode<'a>),
 
     /// A way.
@@ -30,18 +27,50 @@ pub enum Element<'a> {
 #[derive(Clone, Debug)]
 pub struct Node<'a> {
     block: &'a PrimitiveBlock,
-    osmnode: &'a osmformat::Node,
+    id: i64,
+    lat: i64,
+    lon: i64,
+    /// Packed tag key indexes.
+    keys: &'a [u8],
+    /// Packed tag value indexes.
+    vals: &'a [u8],
+    /// The serialized `Info` message, if present.
+    info: Option<&'a [u8]>,
 }
 
 impl<'a> Node<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmnode: &'a osmformat::Node) -> Node<'a> {
-        Node { block, osmnode }
+    /// Decodes one `Node` message.
+    pub(crate) fn from_wire(block: &'a PrimitiveBlock, data: &'a [u8]) -> Node<'a> {
+        let mut node = Node {
+            block,
+            id: 0,
+            lat: 0,
+            lon: 0,
+            keys: &[],
+            vals: &[],
+            info: None,
+        };
+
+        let mut fields = FieldIter::new(data);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            match (field, value) {
+                (1, WireValue::Varint(value)) => node.id = zigzag(value),
+                (2, WireValue::Bytes(bytes)) => node.keys = bytes,
+                (3, WireValue::Bytes(bytes)) => node.vals = bytes,
+                (4, WireValue::Bytes(bytes)) => node.info = Some(bytes),
+                (8, WireValue::Varint(value)) => node.lat = zigzag(value),
+                (9, WireValue::Varint(value)) => node.lon = zigzag(value),
+                _ => {}
+            }
+        }
+
+        node
     }
 
     /// Returns the node id. It should be unique between nodes and might be negative to indicate
     /// that the element has not yet been uploaded to a server.
     pub fn id(&self) -> i64 {
-        self.osmnode.id()
+        self.id
     }
 
     /// Returns an iterator over the tags of this node
@@ -70,14 +99,14 @@ impl<'a> Node<'a> {
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmnode.keys.iter(),
-            val_indices: self.osmnode.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmnode.info.get_or_default())
+        Info::from_wire(self.block, self.info.unwrap_or(&[]))
     }
 
     /// Returns the latitude coordinate in degrees.
@@ -87,7 +116,7 @@ impl<'a> Node<'a> {
 
     /// Returns the latitude coordinate in nanodegrees (10⁻⁹).
     pub fn nano_lat(&self) -> i64 {
-        self.block.lat_offset() + i64::from(self.block.granularity()) * self.osmnode.lat()
+        self.block.lat_offset() + i64::from(self.block.granularity()) * self.lat
     }
 
     /// Returns the latitude coordinate in decimicrodegrees (10⁻⁷).
@@ -102,7 +131,7 @@ impl<'a> Node<'a> {
 
     /// Returns the longitude in nanodegrees (10⁻⁹).
     pub fn nano_lon(&self) -> i64 {
-        self.block.lon_offset() + i64::from(self.block.granularity()) * self.osmnode.lon()
+        self.block.lon_offset() + i64::from(self.block.granularity()) * self.lon
     }
 
     /// Returns the longitude coordinate in decimicrodegrees (10⁻⁷).
@@ -113,11 +142,11 @@ impl<'a> Node<'a> {
     /// Returns an iterator over the tags of this node
     /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
     /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// [`PrimitiveBlock`].
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmnode.keys.iter(),
-            val_indices: self.osmnode.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
@@ -126,7 +155,7 @@ impl<'a> Node<'a> {
     /// contained strings are UTF-8 encoded but it is not safe to assume that (use
     /// `std::str::from_utf8`).
     pub fn raw_stringtable(&self) -> &[Vec<u8>] {
-        self.block.stringtable.s.as_slice()
+        self.block.raw_stringtable()
     }
 }
 
@@ -137,17 +166,52 @@ impl<'a> Node<'a> {
 #[derive(Clone, Debug)]
 pub struct Way<'a> {
     block: &'a PrimitiveBlock,
-    osmway: &'a osmformat::Way,
+    id: i64,
+    keys: &'a [u8],
+    vals: &'a [u8],
+    info: Option<&'a [u8]>,
+    /// Packed, delta coded node references.
+    refs: &'a [u8],
+    /// Packed, delta coded node latitudes (only with `LocationsOnWays`).
+    lat: &'a [u8],
+    /// Packed, delta coded node longitudes (only with `LocationsOnWays`).
+    lon: &'a [u8],
 }
 
 impl<'a> Way<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmway: &'a osmformat::Way) -> Way<'a> {
-        Way { block, osmway }
+    /// Decodes one `Way` message.
+    pub(crate) fn from_wire(block: &'a PrimitiveBlock, data: &'a [u8]) -> Way<'a> {
+        let mut way = Way {
+            block,
+            id: 0,
+            keys: &[],
+            vals: &[],
+            info: None,
+            refs: &[],
+            lat: &[],
+            lon: &[],
+        };
+
+        let mut fields = FieldIter::new(data);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            match (field, value) {
+                (1, WireValue::Varint(value)) => way.id = value as i64,
+                (2, WireValue::Bytes(bytes)) => way.keys = bytes,
+                (3, WireValue::Bytes(bytes)) => way.vals = bytes,
+                (4, WireValue::Bytes(bytes)) => way.info = Some(bytes),
+                (8, WireValue::Bytes(bytes)) => way.refs = bytes,
+                (9, WireValue::Bytes(bytes)) => way.lat = bytes,
+                (10, WireValue::Bytes(bytes)) => way.lon = bytes,
+                _ => {}
+            }
+        }
+
+        way
     }
 
     /// Returns the way id.
     pub fn id(&self) -> i64 {
-        self.osmway.id()
+        self.id
     }
 
     /// Returns an iterator over the tags of this way
@@ -176,14 +240,14 @@ impl<'a> Way<'a> {
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmway.keys.iter(),
-            val_indices: self.osmway.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmway.info.get_or_default())
+        Info::from_wire(self.block, self.info.unwrap_or(&[]))
     }
 
     /// Returns an iterator over the references of this way. Each reference should correspond to a
@@ -193,8 +257,7 @@ impl<'a> Way<'a> {
     /// (to save space) ways themselves usually do not contain geo coordinates.
     pub fn refs(&self) -> WayRefIter<'a> {
         WayRefIter {
-            deltas: self.osmway.refs.iter(),
-            current: 0,
+            deltas: PackedVarints::delta(self.refs),
         }
     }
 
@@ -208,26 +271,26 @@ impl<'a> Way<'a> {
     pub fn node_locations(&self) -> WayNodeLocationsIter<'a> {
         WayNodeLocationsIter {
             block: self.block,
-            dlats: self.osmway.lat.iter(),
-            dlons: self.osmway.lon.iter(),
-            clat: 0,
-            clon: 0,
+            dlats: PackedVarints::delta(self.lat),
+            dlons: PackedVarints::delta(self.lon),
         }
     }
 
-    /// Returns a slice of delta coded node ids.
-    pub fn raw_refs(&self) -> &[i64] {
-        self.osmway.refs.as_slice()
+    /// Returns an iterator over the delta coded node ids of this way.
+    ///
+    /// The values are not accumulated; use [`refs`](Way::refs) for absolute ids.
+    pub fn raw_refs(&self) -> impl Iterator<Item = i64> + 'a {
+        PackedVarints::zigzag(self.refs)
     }
 
     /// Returns an iterator over the tags of this way
     /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
     /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// [`PrimitiveBlock`].
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmway.keys.iter(),
-            val_indices: self.osmway.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
@@ -236,7 +299,7 @@ impl<'a> Way<'a> {
     /// contained strings are UTF-8 encoded but it is not safe to assume that (use
     /// `std::str::from_utf8`).
     pub fn raw_stringtable(&self) -> &[Vec<u8>] {
-        self.block.stringtable.s.as_slice()
+        self.block.raw_stringtable()
     }
 }
 
@@ -246,17 +309,49 @@ impl<'a> Way<'a> {
 #[derive(Clone, Debug)]
 pub struct Relation<'a> {
     block: &'a PrimitiveBlock,
-    osmrel: &'a osmformat::Relation,
+    id: i64,
+    keys: &'a [u8],
+    vals: &'a [u8],
+    info: Option<&'a [u8]>,
+    roles_sid: &'a [u8],
+    memids: &'a [u8],
+    types: &'a [u8],
 }
 
 impl<'a> Relation<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmrel: &'a osmformat::Relation) -> Relation<'a> {
-        Relation { block, osmrel }
+    /// Decodes one `Relation` message.
+    pub(crate) fn from_wire(block: &'a PrimitiveBlock, data: &'a [u8]) -> Relation<'a> {
+        let mut relation = Relation {
+            block,
+            id: 0,
+            keys: &[],
+            vals: &[],
+            info: None,
+            roles_sid: &[],
+            memids: &[],
+            types: &[],
+        };
+
+        let mut fields = FieldIter::new(data);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            match (field, value) {
+                (1, WireValue::Varint(value)) => relation.id = value as i64,
+                (2, WireValue::Bytes(bytes)) => relation.keys = bytes,
+                (3, WireValue::Bytes(bytes)) => relation.vals = bytes,
+                (4, WireValue::Bytes(bytes)) => relation.info = Some(bytes),
+                (8, WireValue::Bytes(bytes)) => relation.roles_sid = bytes,
+                (9, WireValue::Bytes(bytes)) => relation.memids = bytes,
+                (10, WireValue::Bytes(bytes)) => relation.types = bytes,
+                _ => {}
+            }
+        }
+
+        relation
     }
 
     /// Returns the relation id.
     pub fn id(&self) -> i64 {
-        self.osmrel.id()
+        self.id
     }
 
     /// Returns an iterator over the tags of this relation
@@ -285,29 +380,34 @@ impl<'a> Relation<'a> {
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmrel.keys.iter(),
-            val_indices: self.osmrel.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmrel.info.get_or_default())
+        Info::from_wire(self.block, self.info.unwrap_or(&[]))
     }
 
     /// Returns an iterator over the members of this relation.
     pub fn members(&self) -> RelMemberIter<'a> {
-        RelMemberIter::new(self.block, self.osmrel)
+        RelMemberIter {
+            block: self.block,
+            roles: PackedVarints::plain(self.roles_sid),
+            memids: PackedVarints::delta(self.memids),
+            types: PackedVarints::plain(self.types),
+        }
     }
 
     /// Returns an iterator over the tags of this relation
     /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
     /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// [`PrimitiveBlock`].
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmrel.keys.iter(),
-            val_indices: self.osmrel.vals.iter(),
+            keys: PackedVarints::plain(self.keys),
+            vals: PackedVarints::plain(self.vals),
         }
     }
 
@@ -316,7 +416,7 @@ impl<'a> Relation<'a> {
     /// contained strings are UTF-8 encoded but it is not safe to assume that (use
     /// `std::str::from_utf8`).
     pub fn raw_stringtable(&self) -> &[Vec<u8>] {
-        self.block.stringtable.s.as_slice()
+        self.block.raw_stringtable()
     }
 }
 
@@ -325,29 +425,21 @@ impl<'a> Relation<'a> {
 /// Each reference corresponds to a node id.
 #[derive(Clone, Debug)]
 pub struct WayRefIter<'a> {
-    deltas: std::slice::Iter<'a, i64>,
-    current: i64,
+    deltas: PackedVarints<'a>,
 }
 
 impl Iterator for WayRefIter<'_> {
     type Item = i64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.deltas.next() {
-            Some(&d) => {
-                self.current += d;
-                Some(self.current)
-            }
-            None => None,
-        }
+        self.deltas.next_value()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.deltas.size_hint()
+        // Each value takes at least one byte.
+        (0, Some(self.deltas.upper_bound()))
     }
 }
-
-impl ExactSizeIterator for WayRefIter<'_> {}
 
 pub struct WayNodeLocation {
     lat: i64,
@@ -391,38 +483,28 @@ impl WayNodeLocation {
 /// Each element is a pair of coordinates consisting of latitude and longitude.
 #[derive(Clone, Debug)]
 pub struct WayNodeLocationsIter<'a> {
-    block: &'a osmformat::PrimitiveBlock,
-    dlats: std::slice::Iter<'a, i64>,
-    dlons: std::slice::Iter<'a, i64>,
-    clat: i64,
-    clon: i64,
+    block: &'a PrimitiveBlock,
+    dlats: PackedVarints<'a>,
+    dlons: PackedVarints<'a>,
 }
 
 impl Iterator for WayNodeLocationsIter<'_> {
     type Item = WayNodeLocation;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.dlats.next(), self.dlons.next()) {
-            (Some(&dlat), Some(&dlon)) => {
-                self.clat += dlat;
-                self.clon += dlon;
-                Some(WayNodeLocation {
-                    lat: self.block.lat_offset() + i64::from(self.block.granularity()) * self.clat,
-                    lon: self.block.lon_offset() + i64::from(self.block.granularity()) * self.clon,
-                })
-            }
-            _ => None,
-        }
+        let lat = self.dlats.next_value()?;
+        let lon = self.dlons.next_value()?;
+        Some(WayNodeLocation {
+            lat: self.block.lat_offset() + i64::from(self.block.granularity()) * lat,
+            lon: self.block.lon_offset() + i64::from(self.block.granularity()) * lon,
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Both delta arrays are parallel; the shorter one bounds the iterator.
-        let len = self.dlats.len().min(self.dlons.len());
-        (len, Some(len))
+        let upper = self.dlats.upper_bound().min(self.dlons.upper_bound());
+        (0, Some(upper))
     }
 }
-
-impl ExactSizeIterator for WayNodeLocationsIter<'_> {}
 
 /// The element type of a relation member.
 ///
@@ -444,15 +526,14 @@ pub enum RelMemberType {
     Unknown(i32),
 }
 
-impl From<EnumOrUnknown<MemberType>> for RelMemberType {
-    fn from(rmt: EnumOrUnknown<MemberType>) -> RelMemberType {
-        match rmt.enum_value() {
-            Ok(MemberType::NODE) => RelMemberType::Node,
-            Ok(MemberType::WAY) => RelMemberType::Way,
-            Ok(MemberType::RELATION) => RelMemberType::Relation,
-            // Unknown enum values are legal on the wire (proto2 semantics),
-            // so keep the raw number instead of failing the whole parse.
-            Err(raw) => RelMemberType::Unknown(raw),
+impl RelMemberType {
+    /// Maps the raw enum value from the file to a member type.
+    pub(crate) fn from_raw(value: i32) -> RelMemberType {
+        match value {
+            0 => RelMemberType::Node,
+            1 => RelMemberType::Way,
+            2 => RelMemberType::Relation,
+            other => RelMemberType::Unknown(other),
         }
     }
 }
@@ -480,58 +561,35 @@ impl<'a> RelMember<'a> {
 #[derive(Clone, Debug)]
 pub struct RelMemberIter<'a> {
     block: &'a PrimitiveBlock,
-    role_sids: std::slice::Iter<'a, i32>,
-    member_id_deltas: std::slice::Iter<'a, i64>,
-    member_types: std::slice::Iter<'a, EnumOrUnknown<MemberType>>,
-    current_member_id: i64,
-}
-
-impl<'a> RelMemberIter<'a> {
-    fn new(block: &'a PrimitiveBlock, osmrel: &'a osmformat::Relation) -> RelMemberIter<'a> {
-        RelMemberIter {
-            block,
-            role_sids: osmrel.roles_sid.iter(),
-            member_id_deltas: osmrel.memids.iter(),
-            member_types: osmrel.types.iter(),
-            current_member_id: 0,
-        }
-    }
+    roles: PackedVarints<'a>,
+    memids: PackedVarints<'a>,
+    types: PackedVarints<'a>,
 }
 
 impl<'a> Iterator for RelMemberIter<'a> {
     type Item = RelMember<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (
-            self.role_sids.next(),
-            self.member_id_deltas.next(),
-            self.member_types.next(),
-        ) {
-            (Some(role_sid), Some(mem_id_delta), Some(member_type)) => {
-                self.current_member_id += *mem_id_delta;
-                Some(RelMember {
-                    block: self.block,
-                    role_sid: *role_sid,
-                    member_id: self.current_member_id,
-                    member_type: RelMemberType::from(*member_type),
-                })
-            }
-            _ => None,
-        }
+        let role_sid = self.roles.next_value()? as i32;
+        let member_id = self.memids.next_value()?;
+        let member_type = RelMemberType::from_raw(self.types.next_value()? as i32);
+        Some(RelMember {
+            block: self.block,
+            role_sid,
+            member_id,
+            member_type,
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // The three arrays are parallel; the shortest one bounds the members.
-        let len = self
-            .role_sids
-            .len()
-            .min(self.member_id_deltas.len())
-            .min(self.member_types.len());
-        (len, Some(len))
+        let upper = self
+            .roles
+            .upper_bound()
+            .min(self.memids.upper_bound())
+            .min(self.types.upper_bound());
+        (0, Some(upper))
     }
 }
-
-impl ExactSizeIterator for RelMemberIter<'_> {}
 
 /// An iterator over the tags of an element. It returns a pair of strings (key and value).
 ///
@@ -542,8 +600,8 @@ impl ExactSizeIterator for RelMemberIter<'_> {}
 #[derive(Clone, Debug)]
 pub struct TagIter<'a> {
     block: &'a PrimitiveBlock,
-    key_indices: std::slice::Iter<'a, u32>,
-    val_indices: std::slice::Iter<'a, u32>,
+    keys: PackedVarints<'a>,
+    vals: PackedVarints<'a>,
 }
 
 impl<'a> Iterator for TagIter<'a> {
@@ -551,8 +609,8 @@ impl<'a> Iterator for TagIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let key_index = *self.key_indices.next()? as usize;
-            let val_index = *self.val_indices.next()? as usize;
+            let key_index = self.keys.next_value()? as usize;
+            let val_index = self.vals.next_value()? as usize;
             if let Some(tag) =
                 get_stringtable_key_value(self.block, Some(key_index), Some(val_index))
             {
@@ -565,91 +623,109 @@ impl<'a> Iterator for TagIter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Malformed entries are skipped, so only the upper bound is known.
-        let upper = self.key_indices.len().min(self.val_indices.len());
+        let upper = self.keys.upper_bound().min(self.vals.upper_bound());
         (0, Some(upper))
     }
 }
 
 /// An iterator over the tags of an element. It returns a pair of indices (key and value) to the
-/// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+/// stringtable of the current [`PrimitiveBlock`].
 #[derive(Clone, Debug)]
 pub struct RawTagIter<'a> {
-    key_indices: std::slice::Iter<'a, u32>,
-    val_indices: std::slice::Iter<'a, u32>,
+    keys: PackedVarints<'a>,
+    vals: PackedVarints<'a>,
 }
 
 impl Iterator for RawTagIter<'_> {
     type Item = (u32, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.key_indices.next(), self.val_indices.next()) {
-            (Some(&key_index), Some(&val_index)) => Some((key_index, val_index)),
-            _ => None,
-        }
+        let key_index = self.keys.next_value()? as u32;
+        let val_index = self.vals.next_value()? as u32;
+        Some((key_index, val_index))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // The arrays are parallel; the shorter one bounds the pairs.
-        let len = self.key_indices.len().min(self.val_indices.len());
-        (len, Some(len))
+        let upper = self.keys.upper_bound().min(self.vals.upper_bound());
+        (0, Some(upper))
     }
 }
-
-impl ExactSizeIterator for RawTagIter<'_> {}
 
 /// Additional metadata that might be included in each element.
 #[derive(Clone, Debug)]
 pub struct Info<'a> {
     block: &'a PrimitiveBlock,
-    info: &'a osmformat::Info,
+    version: Option<i32>,
+    timestamp: Option<i64>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user_sid: Option<u32>,
+    visible: Option<bool>,
 }
 
 impl<'a> Info<'a> {
-    fn new(block: &'a PrimitiveBlock, info: &'a osmformat::Info) -> Info<'a> {
-        Info { block, info }
+    /// Decodes an `Info` message; an empty slice yields "nothing set".
+    fn from_wire(block: &'a PrimitiveBlock, data: &'a [u8]) -> Info<'a> {
+        let mut info = Info {
+            block,
+            version: None,
+            timestamp: None,
+            changeset: None,
+            uid: None,
+            user_sid: None,
+            visible: None,
+        };
+
+        let mut fields = FieldIter::new(data);
+        while let Ok(Some((field, value))) = fields.next_field() {
+            if let WireValue::Varint(value) = value {
+                match field {
+                    1 => info.version = Some(value as i32),
+                    2 => info.timestamp = Some(value as i64),
+                    3 => info.changeset = Some(value as i64),
+                    4 => info.uid = Some(value as i32),
+                    5 => info.user_sid = Some(value as u32),
+                    6 => info.visible = Some(value != 0),
+                    _ => {}
+                }
+            }
+        }
+
+        info
     }
 
     /// Returns the version of this element.
     pub fn version(&self) -> Option<i32> {
-        self.info.version
+        self.version
     }
 
     /// Returns the time stamp in milliseconds since the epoch.
     pub fn milli_timestamp(&self) -> Option<i64> {
-        if self.info.has_timestamp() {
-            Some(self.info.timestamp() * i64::from(self.block.date_granularity()))
-        } else {
-            None
-        }
+        self.timestamp
+            .map(|timestamp| timestamp * i64::from(self.block.date_granularity()))
     }
 
     /// Returns the changeset id.
     pub fn changeset(&self) -> Option<i64> {
-        self.info.changeset
+        self.changeset
     }
 
     /// Returns the user id.
     pub fn uid(&self) -> Option<i32> {
-        self.info.uid
+        self.uid
     }
 
     /// Returns the user name.
     pub fn user(&self) -> Option<Result<&'a str>> {
-        if self.info.has_user_sid() {
-            Some(str_from_stringtable(
-                self.block,
-                self.info.user_sid() as usize,
-            ))
-        } else {
-            None
-        }
+        self.user_sid
+            .map(|user_sid| str_from_stringtable(self.block, user_sid as usize))
     }
 
     /// Returns the visibility status of an element. This is only relevant if the PBF file contains
     /// historical information.
     pub fn visible(&self) -> bool {
         // If the visible flag is not present it must be assumed to be true.
-        self.info.visible.unwrap_or(true)
+        self.visible.unwrap_or(true)
     }
 
     /// Returns true if the element was deleted.

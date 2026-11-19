@@ -1,9 +1,10 @@
 //! Read and decode blobs
 
 use crate::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{new_blob_error, new_error, new_protobuf_error, BlobError, ErrorKind, Result};
+use crate::error::{
+    new_blob_error, new_error, new_protobuf_error, BlobError, Error, ErrorKind, Result,
+};
 use crate::proto::fileformat;
-use byteorder::ReadBytesExt;
 use protobuf::Message;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -189,25 +190,47 @@ impl<R: Read + Send> BlobReader<R> {
         }
     }
 
-    fn read_blob_header(&mut self) -> Option<Result<fileformat::BlobHeader>> {
-        let header_size: u64 = match self.reader.read_u32::<byteorder::BigEndian>() {
-            Ok(n) => {
-                self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
-                u64::from(n)
+    /// Reads the length prefix of the next blob header.
+    ///
+    /// Returns `None` at a clean end of the stream, i.e. when the stream ends
+    /// exactly on a blob boundary. A partial length prefix (1 to 3 bytes) is a
+    /// truncated file and reported as an error.
+    fn read_header_size(&mut self) -> Option<Result<u64>> {
+        let mut size_bytes = [0_u8; 4];
+        let mut filled = 0;
+
+        while filled < size_bytes.len() {
+            match self.reader.read(&mut size_bytes[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == ::std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.offset = None;
+                    self.last_blob_ok = false;
+                    return Some(Err(e.into()));
+                }
             }
-            Err(e) => {
+        }
+
+        match filled {
+            0 => None,
+            1..=3 => {
                 self.offset = None;
-                return match e.kind() {
-                    ::std::io::ErrorKind::UnexpectedEof => {
-                        //TODO This also accepts corrupted files in the case of 1-3 available bytes
-                        None
-                    }
-                    _ => {
-                        self.last_blob_ok = false;
-                        Some(Err(new_blob_error(BlobError::InvalidHeaderSize)))
-                    }
-                };
+                self.last_blob_ok = false;
+                Some(Err(new_blob_error(BlobError::InvalidHeaderSize)))
             }
+            _ => {
+                self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
+                Some(Ok(u64::from(u32::from_be_bytes(size_bytes))))
+            }
+        }
+    }
+
+    fn read_blob_header(&mut self) -> Option<Result<fileformat::BlobHeader>> {
+        let header_size = match self.read_header_size() {
+            Some(Ok(size)) => size,
+            Some(Err(err)) => return Some(Err(err)),
+            None => return None,
         };
 
         if header_size >= MAX_BLOB_HEADER_SIZE {
@@ -226,6 +249,14 @@ impl<R: Read + Send> BlobReader<R> {
                 return Some(Err(new_protobuf_error(e, "blob header")));
             }
         };
+
+        // A message that ends before consuming the announced length means the
+        // file is truncated (or the length is a lie).
+        if reader.limit() != 0 {
+            self.offset = None;
+            self.last_blob_ok = false;
+            return Some(Err(truncated_stream("content too short for header")));
+        }
 
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
 
@@ -296,6 +327,14 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
                 return Some(Err(new_protobuf_error(e, "blob content")));
             }
         };
+
+        // Same as for the header: a message that stops before the announced
+        // length means the stream ended inside the blob.
+        if reader.limit() != 0 {
+            self.offset = None;
+            self.last_blob_ok = false;
+            return Some(Err(truncated_stream("content too short for blob")));
+        }
 
         self.offset = self.offset.map(|x| ByteOffset(x.0 + data_size));
 
@@ -475,6 +514,14 @@ impl BlobReader<BufReader<File>> {
         let buf_reader = BufReader::new(f);
         Self::new_seekable(buf_reader)
     }
+}
+
+/// Builds an `UnexpectedEof` error for a stream that ends inside a blob.
+fn truncated_stream(message: &'static str) -> Error {
+    new_error(ErrorKind::Io(::std::io::Error::new(
+        ::std::io::ErrorKind::UnexpectedEof,
+        message,
+    )))
 }
 
 /// Validates the `datasize` field of a blob header.

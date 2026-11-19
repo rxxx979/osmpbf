@@ -176,7 +176,10 @@ impl<'a> Iterator for DenseNodeIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.dids.size_hint()
+        // The three delta arrays are parallel; a shorter one ends the
+        // iteration, so it also bounds the reported length.
+        let len = self.dids.len().min(self.dlats.len()).min(self.dlons.len());
+        (len, Some(len))
     }
 }
 
@@ -316,31 +319,38 @@ impl<'a> Iterator for DenseNodeInfoIter<'a> {
 }
 
 /// An iterator over the tags in a dense node.
+///
+/// Iteration is best effort: a tag whose key or value index is out of bounds,
+/// or whose string is not valid UTF-8, is skipped instead of ending the
+/// iteration. Use the node's `raw_tags` method if such data must be handled
+/// exactly.
 #[derive(Clone, Debug)]
 pub struct DenseTagIter<'a> {
     block: &'a osmformat::PrimitiveBlock,
     keys_vals_indices: std::slice::Iter<'a, i32>,
 }
 
-//TODO return Result
 impl<'a> Iterator for DenseTagIter<'a> {
     type Item = (&'a str, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
-        get_stringtable_key_value(
-            self.block,
-            self.keys_vals_indices.next().map(|v| *v as usize),
-            self.keys_vals_indices.next().map(|v| *v as usize),
-        )
+        loop {
+            let key_index = *self.keys_vals_indices.next()? as usize;
+            let val_index = *self.keys_vals_indices.next()? as usize;
+            if let Some(tag) =
+                get_stringtable_key_value(self.block, Some(key_index), Some(val_index))
+            {
+                return Some(tag);
+            }
+            // Skip the malformed tag instead of ending the iteration early.
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.keys_vals_indices.len() / 2;
-        (len, Some(len))
+        // Malformed entries are skipped, so only the upper bound is known.
+        (0, Some(self.keys_vals_indices.len() / 2))
     }
 }
-
-impl ExactSizeIterator for DenseTagIter<'_> {}
 
 /// An iterator over the tags of a node. It returns a pair of indices (key and value) to the
 /// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
@@ -349,7 +359,6 @@ pub struct DenseRawTagIter<'a> {
     keys_vals_indices: std::slice::Iter<'a, i32>,
 }
 
-//TODO return Result
 impl Iterator for DenseRawTagIter<'_> {
     type Item = (i32, i32);
 

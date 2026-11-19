@@ -416,7 +416,9 @@ impl Iterator for WayNodeLocationsIter<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.dlats.size_hint()
+        // Both delta arrays are parallel; the shorter one bounds the iterator.
+        let len = self.dlats.len().min(self.dlons.len());
+        (len, Some(len))
     }
 }
 
@@ -519,13 +521,24 @@ impl<'a> Iterator for RelMemberIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.role_sids.size_hint()
+        // The three arrays are parallel; the shortest one bounds the members.
+        let len = self
+            .role_sids
+            .len()
+            .min(self.member_id_deltas.len())
+            .min(self.member_types.len());
+        (len, Some(len))
     }
 }
 
 impl ExactSizeIterator for RelMemberIter<'_> {}
 
 /// An iterator over the tags of an element. It returns a pair of strings (key and value).
+///
+/// Iteration is best effort: a tag whose key or value index is out of bounds,
+/// or whose string is not valid UTF-8, is skipped instead of ending the
+/// iteration. Use the element's `raw_tags` method to inspect the indices and
+/// string table directly if such data must be handled exactly.
 #[derive(Clone, Debug)]
 pub struct TagIter<'a> {
     block: &'a PrimitiveBlock,
@@ -533,24 +546,29 @@ pub struct TagIter<'a> {
     val_indices: std::slice::Iter<'a, u32>,
 }
 
-//TODO return Result?
 impl<'a> Iterator for TagIter<'a> {
     type Item = (&'a str, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
-        get_stringtable_key_value(
-            self.block,
-            self.key_indices.next().map(|v| *v as usize),
-            self.val_indices.next().map(|v| *v as usize),
-        )
+        loop {
+            let key_index = *self.key_indices.next()? as usize;
+            let val_index = *self.val_indices.next()? as usize;
+            if let Some(tag) =
+                get_stringtable_key_value(self.block, Some(key_index), Some(val_index))
+            {
+                return Some(tag);
+            }
+            // Skip the malformed tag; returning `None` here would silently end
+            // the iteration and drop every remaining tag of this element.
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.key_indices.size_hint()
+        // Malformed entries are skipped, so only the upper bound is known.
+        let upper = self.key_indices.len().min(self.val_indices.len());
+        (0, Some(upper))
     }
 }
-
-impl ExactSizeIterator for TagIter<'_> {}
 
 /// An iterator over the tags of an element. It returns a pair of indices (key and value) to the
 /// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
@@ -560,7 +578,6 @@ pub struct RawTagIter<'a> {
     val_indices: std::slice::Iter<'a, u32>,
 }
 
-//TODO return Result?
 impl Iterator for RawTagIter<'_> {
     type Item = (u32, u32);
 
@@ -572,7 +589,9 @@ impl Iterator for RawTagIter<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.key_indices.size_hint()
+        // The arrays are parallel; the shorter one bounds the pairs.
+        let len = self.key_indices.len().min(self.val_indices.len());
+        (len, Some(len))
     }
 }
 

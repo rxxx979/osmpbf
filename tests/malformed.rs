@@ -13,6 +13,12 @@ const NEGATIVE_DATASIZE: &str = "tests/data/negative_datasize.osm.pbf";
 const HUGE_HEADER: &str = "tests/data/huge_header.osm.pbf";
 const POISONED_READER: &str = "tests/data/poisoned_reader.osm.pbf";
 const VALID_FILE: &str = "tests/test.osm.pbf";
+const BAD_TAG_INDEX: &str = "tests/data/bad_tag_index.osm.pbf";
+const BAD_UTF8: &str = "tests/data/bad_utf8.osm.pbf";
+const DENSE_BAD_TAG: &str = "tests/data/dense_bad_tag.osm.pbf";
+const DENSE_MISMATCH: &str = "tests/data/dense_mismatch.osm.pbf";
+const TRUNCATED_DATASIZE: &str = "tests/data/truncated_datasize.osm.pbf";
+const THREE_BYTES: &str = "tests/data/three_bytes.osm.pbf";
 
 /// An unknown relation member type must be reported as `Unknown`, not panic.
 #[test]
@@ -102,4 +108,117 @@ fn seek_recovers_from_a_broken_blob() {
 
     let again = reader.blob_from_offset(ByteOffset(0)).unwrap();
     assert_eq!(again.offset(), Some(ByteOffset(0)));
+}
+
+/// A tag whose key index is out of bounds is skipped, and the following tags
+/// are still returned.
+#[test]
+fn bad_tag_index_is_skipped() {
+    let reader = ElementReader::from_path(BAD_TAG_INDEX).unwrap();
+    let mut nodes = 0;
+
+    reader
+        .for_each(|element| {
+            if let Element::Node(node) = element {
+                assert_eq!(node.tags().collect::<Vec<_>>(), vec![("role", "name")]);
+                nodes += 1;
+            }
+        })
+        .unwrap();
+
+    assert_eq!(nodes, 1);
+}
+
+/// Malformed tags are skipped, so only an upper bound for the length is known.
+#[test]
+fn tag_size_hint_is_conservative() {
+    let reader = ElementReader::from_path(BAD_TAG_INDEX).unwrap();
+
+    reader
+        .for_each(|element| {
+            if let Element::Node(node) = element {
+                assert_eq!(node.tags().size_hint(), (0, Some(2)));
+            }
+        })
+        .unwrap();
+}
+
+/// A tag that is not valid UTF-8 is skipped instead of ending the iteration.
+#[test]
+fn invalid_utf8_tag_is_skipped() {
+    let reader = ElementReader::from_path(BAD_UTF8).unwrap();
+
+    reader
+        .for_each(|element| {
+            if let Element::Node(node) = element {
+                assert_eq!(node.tags().collect::<Vec<_>>(), vec![("role", "name")]);
+            }
+        })
+        .unwrap();
+}
+
+/// The same skipping applies to the tags of a dense node.
+#[test]
+fn dense_bad_tag_is_skipped() {
+    let reader = ElementReader::from_path(DENSE_BAD_TAG).unwrap();
+
+    reader
+        .for_each(|element| {
+            if let Element::DenseNode(node) = element {
+                assert_eq!(node.tags().collect::<Vec<_>>(), vec![("role", "name")]);
+            }
+        })
+        .unwrap();
+}
+
+/// Parallel arrays of different lengths must not make `len()` lie.
+#[test]
+fn dense_node_len_matches_yielded() {
+    let mmap = unsafe { Mmap::from_path(DENSE_MISMATCH).unwrap() };
+    let mut groups = 0;
+
+    for blob in MmapBlobReader::new(&mmap) {
+        if let BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            for group in block.groups() {
+                let nodes = group.dense_nodes();
+                assert_eq!(nodes.len(), nodes.count());
+                groups += 1;
+            }
+        }
+    }
+
+    assert_eq!(groups, 1);
+}
+
+/// A blob that claims to be longer than the file is an error, not an accepted
+/// and truncated result.
+#[test]
+fn truncated_blob_is_an_error() {
+    let mut reader = BlobReader::from_path(TRUNCATED_DATASIZE).unwrap();
+    assert!(reader.next().unwrap().is_ok(), "header blob");
+    assert!(reader.next().unwrap().is_err(), "truncated blob");
+
+    let result = ElementReader::from_path(TRUNCATED_DATASIZE).and_then(|r| r.for_each(|_| {}));
+    assert!(result.is_err());
+}
+
+/// A file that ends in the middle of a length prefix is an error.
+#[test]
+fn three_byte_file_is_an_error() {
+    let mut reader = BlobReader::from_path(THREE_BYTES).unwrap();
+    let item = reader.next().expect("trailing bytes must be reported");
+    assert!(item.is_err());
+}
+
+/// The stricter checks must not reject well-formed files.
+#[test]
+fn valid_file_still_reads() {
+    let mut elements = 0;
+
+    ElementReader::from_path(VALID_FILE)
+        .unwrap()
+        .for_each(|_| elements += 1)
+        .unwrap();
+
+    assert_eq!(elements, 5);
 }

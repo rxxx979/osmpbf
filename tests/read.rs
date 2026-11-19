@@ -418,3 +418,25 @@ fn read_loc_on_ways_file() {
         assert_eq!(members[0].role().unwrap(), "test_role");
     }
 }
+
+/// `IndexedReader` must start scanning at the stream position it was created
+/// with, not at absolute offset 0.
+#[test]
+fn indexed_reader_from_nonzero_offset() {
+    let mut bytes = b"pad!".to_vec();
+    bytes.extend_from_slice(&std::fs::read("tests/test.osm.pbf").unwrap());
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    cursor.set_position(4);
+
+    let mut reader = IndexedReader::new(cursor).unwrap();
+    let mut nodes = 0;
+    reader
+        .for_each_node(|element| match element {
+            Element::Node(_) | Element::DenseNode(_) => nodes += 1,
+            _ => {}
+        })
+        .unwrap();
+
+    assert_eq!(nodes, 3);
+}

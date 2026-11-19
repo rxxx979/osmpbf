@@ -87,15 +87,21 @@ impl HeaderBlock {
 
 /// A bounding box that is usually included in a [`HeaderBlock`].
 /// The maximum precision of the coordinates is one nanodegree (10⁻⁹).
+///
+/// The field names follow the OSM API `bbox` convention, which is used by the
+/// writers of the format: `left`/`right` are the west/east edges and
+/// `top`/`bottom` are the north/south edges. So `top` holds the *maximum*
+/// latitude and `bottom` the *minimum* latitude, which is the opposite of what
+/// the words suggest when read as a rectangle on screen.
 #[derive(Clone, Debug)]
 pub struct HeaderBBox {
-    /// left coordinate in degrees (minimum longitude)
+    /// left coordinate in degrees (minimum longitude, west edge)
     pub left: f64,
-    /// right coordinate in degrees (maximum longitude)
+    /// right coordinate in degrees (maximum longitude, east edge)
     pub right: f64,
-    /// top coordinate in degrees (minimum latitude)
+    /// top coordinate in degrees (maximum latitude, north edge)
     pub top: f64,
-    /// bottom coordinate in degrees (maximum latitude)
+    /// bottom coordinate in degrees (minimum latitude, south edge)
     pub bottom: f64,
 }
 

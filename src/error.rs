@@ -67,12 +67,12 @@ pub enum ErrorKind {
 pub enum BlobError {
     /// Header size could not be decoded to a u32.
     InvalidHeaderSize,
-    /// Blob header is bigger than [`MAX_BLOB_HEADER_SIZE`](blob/MAX_BLOB_HEADER_SIZE.v.html).
+    /// Blob header is bigger than [`MAX_BLOB_HEADER_SIZE`](crate::blob::MAX_BLOB_HEADER_SIZE).
     HeaderTooBig {
         /// Blob header size in bytes.
         size: u64,
     },
-    /// Blob content is bigger than [`MAX_BLOB_MESSAGE_SIZE`](blob/MAX_BLOB_MESSAGE_SIZE.v.html).
+    /// Blob content is bigger than [`MAX_BLOB_MESSAGE_SIZE`](crate::blob::MAX_BLOB_MESSAGE_SIZE).
     MessageTooBig {
         /// Blob content size in bytes.
         size: u64,
@@ -81,6 +81,11 @@ pub enum BlobError {
     InvalidDataSize {
         /// Announced size in bytes, as stored in the header.
         size: i64,
+    },
+    /// The blob uses a compression format this crate does not support.
+    UnsupportedCompression {
+        /// Name of the compression format found in the blob.
+        kind: &'static str,
     },
     /// The blob is empty because the `raw` and `zlib-data` fields are missing.
     Empty,
@@ -99,56 +104,13 @@ impl From<Error> for io::Error {
 }
 
 impl StdError for Error {
-    fn description(&self) -> &str {
-        match *self.0 {
-            ErrorKind::Io(ref err, ..) => {
-                use std::io::ErrorKind;
-                match err.kind() {
-                    ErrorKind::NotFound => "io error: not found",
-                    ErrorKind::PermissionDenied => "io error: permission denied",
-                    ErrorKind::ConnectionRefused => "io error: connection refused",
-                    ErrorKind::ConnectionReset => "io error: connection reset",
-                    ErrorKind::ConnectionAborted => "io error: connection aborted",
-                    ErrorKind::NotConnected => "io error: not connected",
-                    ErrorKind::AddrInUse => "io error: address in use",
-                    ErrorKind::AddrNotAvailable => "io error: address not available",
-                    ErrorKind::BrokenPipe => "io error: broken pipe",
-                    ErrorKind::AlreadyExists => "io error: already exists",
-                    ErrorKind::WouldBlock => "io error: would block",
-                    ErrorKind::InvalidInput => "io error: invalid input",
-                    ErrorKind::InvalidData => "io error: invalid data",
-                    ErrorKind::TimedOut => "io error: timed out",
-                    ErrorKind::WriteZero => "io error: write zero",
-                    ErrorKind::Interrupted => "io error: interrupted",
-                    ErrorKind::Other => "io error: other",
-                    ErrorKind::UnexpectedEof => "io error: unexpected EOF",
-                    _ => "io error",
-                }
-            }
-            ErrorKind::Protobuf { .. } => "protobuf error",
-            ErrorKind::StringtableUtf8 { .. } => "UTF-8 error in stringtable",
-            ErrorKind::StringtableIndexOutOfBounds { .. } => "stringtable index out of bounds",
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => {
-                "blob header size could not be decoded"
-            }
-            ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => "blob header is too big",
-            ErrorKind::Blob(BlobError::MessageTooBig { .. }) => "blob message is too big",
-            ErrorKind::Blob(BlobError::InvalidDataSize { .. }) => "invalid blob data size",
-            ErrorKind::Blob(BlobError::Empty) => "blob is missing fields 'raw' and 'zlib_data",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn StdError> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self.0 {
             ErrorKind::Io(ref err) => Some(err),
             ErrorKind::Protobuf { ref err, .. } => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => None,
-            ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => None,
-            ErrorKind::Blob(BlobError::MessageTooBig { .. }) => None,
-            ErrorKind::Blob(BlobError::InvalidDataSize { .. }) => None,
-            ErrorKind::Blob(BlobError::Empty) => None,
+            ErrorKind::Blob(_) => None,
         }
     }
 }
@@ -177,6 +139,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Blob(BlobError::InvalidDataSize { size }) => {
                 write!(f, "invalid blob data size: {size} bytes")
+            }
+            ErrorKind::Blob(BlobError::UnsupportedCompression { kind }) => {
+                write!(f, "unsupported blob compression: {kind}")
             }
             ErrorKind::Blob(BlobError::Empty) => {
                 write!(f, "blob is missing fields 'raw' and 'zlib_data'")

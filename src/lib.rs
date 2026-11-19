@@ -7,7 +7,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-osmpbf = "0.2"
+osmpbf = "0.3"
 ```
 
 ## Example: Count ways

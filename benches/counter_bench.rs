@@ -1,15 +1,19 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use osmpbf::{Element, ElementReader};
-use std::env;
 
 criterion_group!(benches, bench_count);
 criterion_main!(benches);
 
 fn bench_count(c: &mut Criterion) {
-    let file = env!(
-        "OSMPBF_BENCH_FILE",
-        "Must specify OSMPBF_BENCH_FILE env var when compiling this benchmark"
-    );
+    // Read at run time, so that building the benchmarks (for example with
+    // `cargo test --all-targets`) does not require the variable to be set.
+    let file = match std::env::var("OSMPBF_BENCH_FILE") {
+        Ok(file) => file,
+        Err(_) => {
+            eprintln!("Skipping benchmark: set OSMPBF_BENCH_FILE to a *.osm.pbf file");
+            return;
+        }
+    };
 
     #[cfg(feature = "rust-zlib")]
     println!("Using rust-zlib (miniz_oxide)");
@@ -20,7 +24,7 @@ fn bench_count(c: &mut Criterion) {
 
     c.bench_function(format!("Benchmarking using {file}").as_str(), |b| {
         b.iter(|| {
-            let path = std::path::Path::new(file);
+            let path = std::path::Path::new(&file);
             let reader = ElementReader::from_path(path).unwrap();
             reader
                 .par_map_reduce(

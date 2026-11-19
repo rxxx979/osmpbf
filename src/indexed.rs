@@ -112,6 +112,10 @@ impl BlobInfo {
 pub struct IndexedReader<R: Read + Seek + Send> {
     reader: BlobReader<R>,
     index: Vec<BlobInfo>,
+    /// Offset of the first blob in the underlying stream. The index and all
+    /// recorded blob offsets are absolute positions in that stream, so this is
+    /// where scanning has to start.
+    start: ByteOffset,
 }
 
 impl<R: Read + Seek + Send> IndexedReader<R> {
@@ -131,11 +135,13 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
-    pub fn new(reader: R) -> Result<Self> {
+    pub fn new(mut reader: R) -> Result<Self> {
+        let start = ByteOffset(reader.stream_position()?);
         let reader = BlobReader::new_seekable(reader)?;
         Ok(Self {
             reader,
             index: vec![],
+            start,
         })
     }
 
@@ -148,8 +154,8 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
             return Ok(());
         }
 
-        // Seek to the beginning of the reader.
-        self.reader.seek(ByteOffset(0))?;
+        // Seek to the first blob of the stream (not necessarily offset 0).
+        self.reader.seek(self.start)?;
 
         while let Some(result) = self.reader.next_header_skip_blob() {
             let (header, offset) = result?;

@@ -552,6 +552,20 @@ pub(crate) fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
     } else if blob.has_zlib_data() {
         let mut decoder = ZlibDecoder::new(blob.zlib_data()).take(MAX_BLOB_MESSAGE_SIZE);
         T::parse_from_reader(&mut decoder).map_err(|e| new_protobuf_error(e, "blob zlib data"))
+    } else if blob.has_lz4_data() {
+        // Recognized by the format, but not implemented here. Reporting it
+        // explicitly beats claiming that the blob is empty.
+        Err(new_blob_error(BlobError::UnsupportedCompression {
+            kind: "lz4",
+        }))
+    } else if blob.has_zstd_data() {
+        Err(new_blob_error(BlobError::UnsupportedCompression {
+            kind: "zstd",
+        }))
+    } else if blob.has_lzma_data() {
+        Err(new_blob_error(BlobError::UnsupportedCompression {
+            kind: "lzma",
+        }))
     } else {
         Err(new_blob_error(BlobError::Empty))
     }

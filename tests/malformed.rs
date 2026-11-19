@@ -19,6 +19,7 @@ const DENSE_BAD_TAG: &str = "tests/data/dense_bad_tag.osm.pbf";
 const DENSE_MISMATCH: &str = "tests/data/dense_mismatch.osm.pbf";
 const TRUNCATED_DATASIZE: &str = "tests/data/truncated_datasize.osm.pbf";
 const THREE_BYTES: &str = "tests/data/three_bytes.osm.pbf";
+const LZ4_BLOB: &str = "tests/data/lz4_blob.osm.pbf";
 
 /// An unknown relation member type must be reported as `Unknown`, not panic.
 #[test]
@@ -221,4 +222,31 @@ fn valid_file_still_reads() {
         .unwrap();
 
     assert_eq!(elements, 5);
+}
+
+/// A blob compressed with a format this crate does not decode must say so,
+/// instead of claiming that the blob is empty.
+#[test]
+fn unsupported_compression_is_reported() {
+    let result = ElementReader::from_path(LZ4_BLOB).and_then(|reader| reader.for_each(|_| {}));
+    let err = result.expect_err("lz4 blobs are not supported");
+
+    assert!(matches!(
+        err.kind(),
+        ErrorKind::Blob(BlobError::UnsupportedCompression { kind: "lz4" })
+    ));
+}
+
+/// Errors must expose their underlying cause through `source()`.
+#[test]
+fn errors_chain_to_their_cause() {
+    let io_err = ElementReader::from_path("tests/data/does-not-exist.osm.pbf")
+        .expect_err("opening a missing file fails");
+    assert!(std::error::Error::source(&io_err).is_some());
+
+    let mut reader = BlobReader::from_path(POISONED_READER).unwrap();
+    reader.next();
+    reader.next();
+    let protobuf_err = reader.next().unwrap().unwrap_err();
+    assert!(std::error::Error::source(&protobuf_err).is_some());
 }

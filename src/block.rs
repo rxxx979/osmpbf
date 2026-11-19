@@ -2,7 +2,7 @@
 
 use crate::dense::DenseNodeIter;
 use crate::elements::{Element, Node, Relation, Way};
-use crate::error::{new_error, ErrorKind, Result};
+use crate::error::{ErrorKind, Result, new_error};
 use crate::proto::osmformat;
 use std;
 

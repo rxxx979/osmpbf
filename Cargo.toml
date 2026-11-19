@@ -3,13 +3,12 @@ name = "osmpbf"
 version = "0.3.8"
 authors = ["Johannes Hofmann <mail@b-r-u.org>"]
 repository = "https://github.com/b-r-u/osmpbf"
-homepage = "https://github.com/b-r-u/osmpbf"
 description = "A reader for the OpenStreetMap PBF file format (*.osm.pbf)."
 categories = ["parser-implementations", "encoding", "science"]
 keywords = ["openstreetmap", "osm", "pbf", "protocolbuffer", "protobuf"]
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-edition = "2021"
+edition = "2024"
 
 [features]
 default = ["rust-zlib"]
@@ -18,18 +17,17 @@ zlib = ["flate2/zlib"]
 zlib-ng = ["flate2/zlib-ng"]
 
 [dependencies]
-byteorder = "1.4"
-flate2 = { version = "1.0", default-features = false }
-memmap2 = "0.5"
-protobuf = "3.1"
-rayon = "1.5"
+flate2 = { version = "1.1", default-features = false }
+memmap2 = "0.9"
+protobuf = "3.7"
+rayon = "1.12"
 
 [dev-dependencies]
 assert_approx_eq = "1.1.0"
-criterion = { version = "0.3", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [build-dependencies]
-protobuf-codegen = "3.1"
+protobuf-codegen = "3.7"
 
 [[bench]]
 name = "counter_bench"

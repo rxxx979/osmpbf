@@ -1,12 +1,11 @@
 //! Iterate over blobs from a memory map
 
 use self::fileformat::BlobHeader;
-use crate::blob::{blob_data_size, decode_blob, BlobDecode, BlobType, ByteOffset};
-use crate::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
-use crate::proto::{fileformat, osmformat};
 use crate::MAX_BLOB_HEADER_SIZE;
-use byteorder::ByteOrder;
+use crate::blob::{BlobDecode, BlobType, ByteOffset, blob_data_size, decode_blob};
+use crate::block::{HeaderBlock, PrimitiveBlock};
+use crate::error::{BlobError, Result, new_blob_error, new_protobuf_error};
+use crate::proto::{fileformat, osmformat};
 use protobuf::Message;
 use std::fs::File;
 use std::path::Path;
@@ -37,9 +36,13 @@ impl Mmap {
     /// # foo().unwrap();
     /// ```
     pub unsafe fn from_file(file: &File) -> Result<Mmap> {
-        memmap2::Mmap::map(file)
-            .map(|m| Mmap { mmap: m })
-            .map_err(|e| e.into())
+        // SAFETY: the caller guarantees that the file is not modified or
+        // truncated while this mapping (and any copy of it) is alive.
+        unsafe {
+            memmap2::Mmap::map(file)
+                .map(|m| Mmap { mmap: m })
+                .map_err(|e| e.into())
+        }
     }
 
     /// Creates a memory map from a given path.
@@ -61,9 +64,13 @@ impl Mmap {
     /// ```
     pub unsafe fn from_path<P: AsRef<Path>>(path: P) -> Result<Mmap> {
         let file = File::open(&path)?;
-        memmap2::Mmap::map(&file)
-            .map(|m| Mmap { mmap: m })
-            .map_err(|e| e.into())
+        // SAFETY: the caller guarantees that the file is not modified or
+        // truncated while this mapping (and any copy of it) is alive.
+        unsafe {
+            memmap2::Mmap::map(&file)
+                .map(|m| Mmap { mmap: m })
+                .map_err(|e| e.into())
+        }
     }
 
     /// Returns an iterator over the blobs in this memory map.
@@ -204,7 +211,7 @@ impl<'a> Iterator for MmapBlobReader<'a> {
             _ => {}
         }
 
-        let header_size = byteorder::BigEndian::read_u32(slice) as usize;
+        let header_size = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
 
         if header_size as u64 >= MAX_BLOB_HEADER_SIZE {
             self.last_blob_ok = false;

@@ -2,7 +2,7 @@
 
 use crate::block::{HeaderBlock, PrimitiveBlock};
 use crate::error::{
-    new_blob_error, new_error, new_protobuf_error, BlobError, Error, ErrorKind, Result,
+    BlobError, Error, ErrorKind, Result, new_blob_error, new_error, new_protobuf_error,
 };
 use crate::proto::fileformat;
 use protobuf::Message;

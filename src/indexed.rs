@@ -40,7 +40,7 @@ pub struct IdRanges {
     node_ids: Option<RangeInclusive<i64>>,
     way_ids: Option<RangeInclusive<i64>>,
     //TODO actually use this field
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "relation member filtering is not implemented yet")]
     relation_ids: Option<RangeInclusive<i64>>,
 }
 

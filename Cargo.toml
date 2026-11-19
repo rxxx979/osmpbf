@@ -11,18 +11,13 @@ license = "MIT OR Apache-2.0"
 edition = "2024"
 
 [features]
-default = ["rust-zlib", "mmap"]
+default = ["rust-zlib"]
 rust-zlib = ["flate2/rust_backend"]
 zlib = ["flate2/zlib"]
 zlib-ng = ["flate2/zlib-ng"]
-## Memory-mapped reading (`Mmap`, `MmapBlob`, `MmapBlobReader`). This is the only
-## part of the crate that contains `unsafe` code; building without it gives a
-## crate that is `forbid(unsafe_code)`.
-mmap = ["dep:memmap2"]
 
 [dependencies]
 flate2 = { version = "1.1", default-features = false }
-memmap2 = { version = "0.9", optional = true }
 protobuf = "3.7"
 rayon = "1.12"
 

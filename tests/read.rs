@@ -221,33 +221,6 @@ fn read_blobs() {
     }
 }
 
-#[cfg(feature = "mmap")]
-#[test]
-fn read_mmap_blobs() {
-    for test_file in TEST_FILE_PATHS {
-        let mmap = unsafe { Mmap::from_path(test_file.path).unwrap() };
-        let reader = MmapBlobReader::new(&mmap);
-
-        let blobs = reader.collect::<Result<Vec<_>>>().unwrap();
-
-        assert_eq!(blobs.len(), 2);
-        assert_eq!(blobs[0].get_type(), BlobType::OsmHeader);
-        assert_eq!(blobs[1].get_type(), BlobType::OsmData);
-
-        if let BlobDecode::OsmHeader(header) = blobs[0].decode().unwrap() {
-            check_header_block_content(&header, test_file);
-        } else {
-            panic!("Unexpected blob type");
-        }
-
-        if let BlobDecode::OsmData(primitive_block) = blobs[1].decode().unwrap() {
-            check_primitive_block_content(&primitive_block);
-        } else {
-            panic!("Unexpected blob type");
-        }
-    }
-}
-
 #[test]
 fn decode_blob() {
     for test_file in TEST_FILE_PATHS {

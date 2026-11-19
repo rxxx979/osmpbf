@@ -221,6 +221,7 @@ fn read_blobs() {
     }
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn read_mmap_blobs() {
     for test_file in TEST_FILE_PATHS {

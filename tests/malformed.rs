@@ -9,13 +9,16 @@
 use osmpbf::*;
 
 const UNKNOWN_MEMBER_TYPE: &str = "tests/data/unknown_member_type.osm.pbf";
+#[cfg(feature = "mmap")]
 const NEGATIVE_DATASIZE: &str = "tests/data/negative_datasize.osm.pbf";
+#[cfg(feature = "mmap")]
 const HUGE_HEADER: &str = "tests/data/huge_header.osm.pbf";
 const POISONED_READER: &str = "tests/data/poisoned_reader.osm.pbf";
 const VALID_FILE: &str = "tests/test.osm.pbf";
 const BAD_TAG_INDEX: &str = "tests/data/bad_tag_index.osm.pbf";
 const BAD_UTF8: &str = "tests/data/bad_utf8.osm.pbf";
 const DENSE_BAD_TAG: &str = "tests/data/dense_bad_tag.osm.pbf";
+#[cfg(feature = "mmap")]
 const DENSE_MISMATCH: &str = "tests/data/dense_mismatch.osm.pbf";
 const TRUNCATED_DATASIZE: &str = "tests/data/truncated_datasize.osm.pbf";
 const THREE_BYTES: &str = "tests/data/three_bytes.osm.pbf";
@@ -44,6 +47,7 @@ fn unknown_relation_member_type_is_not_a_panic() {
 }
 
 /// A negative `datasize` must be an error on both reader paths.
+#[cfg(feature = "mmap")]
 #[test]
 fn negative_datasize_is_an_error() {
     let mut reader = BlobReader::from_path(NEGATIVE_DATASIZE).unwrap();
@@ -66,6 +70,7 @@ fn negative_datasize_is_an_error() {
 
 /// A blob header that claims 64 KiB in an 8-byte file must end the iteration
 /// on the memory-mapped reader instead of repeating the same error forever.
+#[cfg(feature = "mmap")]
 #[test]
 fn mmap_reader_stops_after_an_error() {
     let mmap = unsafe { Mmap::from_path(HUGE_HEADER).unwrap() };
@@ -79,6 +84,7 @@ fn mmap_reader_stops_after_an_error() {
 }
 
 /// Seeking past the end of the map must not panic.
+#[cfg(feature = "mmap")]
 #[test]
 fn mmap_seek_past_end_is_not_a_panic() {
     let mmap = unsafe { Mmap::from_path(VALID_FILE).unwrap() };
@@ -173,6 +179,7 @@ fn dense_bad_tag_is_skipped() {
 }
 
 /// Parallel arrays of different lengths must not make `len()` lie.
+#[cfg(feature = "mmap")]
 #[test]
 fn dense_node_len_matches_yielded() {
     let mmap = unsafe { Mmap::from_path(DENSE_MISMATCH).unwrap() };

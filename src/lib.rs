@@ -62,6 +62,11 @@ println!("Number of ways: {ways}");
 */
 
 #![recursion_limit = "1024"]
+// The memory-mapped reader is the only place that needs `unsafe`: mapping a
+// file is unsound if anything modifies it while it is mapped, so the safety
+// contract has to be exposed to the caller. Everything else is checked here.
+#![cfg_attr(feature = "mmap", deny(unsafe_code))]
+#![cfg_attr(not(feature = "mmap"), forbid(unsafe_code))]
 
 #[cfg(any(
     all(feature = "rust-zlib", feature = "zlib"),
@@ -79,6 +84,7 @@ pub use dense::*;
 pub use elements::*;
 pub use error::{BlobError, Error, ErrorKind, Result};
 pub use indexed::*;
+#[cfg(feature = "mmap")]
 pub use mmap_blob::*;
 pub use reader::*;
 
@@ -88,6 +94,7 @@ pub mod dense;
 pub mod elements;
 mod error;
 pub mod indexed;
+#[cfg(feature = "mmap")]
 pub mod mmap_blob;
 pub mod reader;
 

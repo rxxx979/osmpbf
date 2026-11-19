@@ -63,7 +63,11 @@ println!("Number of ways: {ways}");
 ## Build Features
 * `rust-zlib` (default) -- use the pure Rust zlib implementation`miniz_oxide`
 * `zlib` -- use the widely available `zlib` library
-* `zlib-ng` -- use the `zlib-ng` library for better performance.
+* `zlib-ng` -- use the `zlib-ng` library for better performance
+* `mmap` (default) -- enable the memory-mapped reader (`Mmap`, `MmapBlob`,
+  `MmapBlobReader`). This is the only part of the crate that contains `unsafe`
+  code; build with `default-features = false` to get a crate that is
+  `forbid(unsafe_code)`.
 
 ## The PBF format
 

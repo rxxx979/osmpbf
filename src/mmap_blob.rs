@@ -1,4 +1,8 @@
 //! Iterate over blobs from a memory map
+//!
+//! This module is enabled by the `mmap` cargo feature and is the only place in
+//! the crate that contains `unsafe` code.
+#![allow(unsafe_code)]
 
 use self::fileformat::BlobHeader;
 use crate::MAX_BLOB_HEADER_SIZE;

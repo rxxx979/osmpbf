@@ -67,7 +67,9 @@ println!("Number of ways: {ways}");
 * `mmap` (default) -- enable the memory-mapped reader (`Mmap`, `MmapBlob`,
   `MmapBlobReader`). This is the only part of the crate that contains `unsafe`
   code; build with `default-features = false` to get a crate that is
-  `forbid(unsafe_code)`.
+  `forbid(unsafe_code)`. A full scan through a memory map pages in the whole
+  file, so prefer the streaming `ElementReader` for files larger than RAM
+  (measured: 1.5 GB file => 1.7 GB RSS with `mmap`, 0.6 GB with streaming).
 
 ## The PBF format
 
